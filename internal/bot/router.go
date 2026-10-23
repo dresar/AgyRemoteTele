@@ -94,7 +94,12 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
-	cmd := msg.Command()
+	if text == "/" {
+		r.handleHelp(chatID)
+		return
+	}
+
+	cmd := strings.ToLower(msg.Command())
 	args := strings.TrimSpace(msg.CommandArguments())
 
 	switch cmd {

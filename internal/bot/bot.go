@@ -38,6 +38,8 @@ func NewBot(token string, router *Router, sessionStore *session.Store) (*Bot, er
 func (b *Bot) Start(ctx context.Context) error {
 	log.Printf("AgyRemoteTele bot started as @%s (ID: %d)", b.api.Self.UserName, b.api.Self.ID)
 
+	b.registerCommands()
+
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 30
 
@@ -61,6 +63,28 @@ func (b *Bot) Start(ctx context.Context) error {
 			}(update)
 		}
 	}
+}
+
+func (b *Bot) registerCommands() {
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Pusat kontrol interaktif AgyRemoteTele"},
+		{Command: "status", Description: "Live telemetry VPS: CPU, RAM, Disk"},
+		{Command: "ask", Description: "Kirim instruksi prompt ke agent AGY"},
+		{Command: "profile", Description: "Ganti profil worker (agy01 - agy15)"},
+		{Command: "history", Description: "Lihat transcript sesi percakapan"},
+		{Command: "resume", Description: "Lanjutkan percakapan sebelumnya"},
+		{Command: "new", Description: "Mulai percakapan baru dari awal"},
+		{Command: "ls", Description: "Jelajahi direktori file workspace"},
+		{Command: "cd", Description: "Pindah direktori kerja aktif"},
+		{Command: "cat", Description: "Lihat isi file di VPS"},
+		{Command: "get", Description: "Download file dari VPS sebagai dokumen"},
+		{Command: "sh", Description: "Jalankan perintah bash terminal"},
+		{Command: "git", Description: "Cek git status, diff, dan sync"},
+		{Command: "help", Description: "Panduan bantuan penggunaan bot"},
+	}
+
+	cfg := tgbotapi.NewSetMyCommands(commands...)
+	_, _ = b.api.Request(cfg)
 }
 
 func (b *Bot) Stop() {
