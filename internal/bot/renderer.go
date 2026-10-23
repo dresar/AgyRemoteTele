@@ -139,6 +139,7 @@ func (r *Renderer) RenderStatus(m *system.Metrics, activeProfile string) string 
 	b.WriteString("<b>🟢 VPS TELEMETRY & SYSTEM HEALTH</b>\n\n")
 
 	b.WriteString(fmt.Sprintf("<b>Worker Profile:</b> <code>%s</code>\n", html.EscapeString(activeProfile)))
+	b.WriteString(fmt.Sprintf("<b>Allocated CPU:</b> <code>%.0f vCPU</code>\n", m.AllocatedVCPU))
 	b.WriteString(fmt.Sprintf("<b>System Uptime:</b> <code>%s</code>\n", system.FormatUptime(m.SystemUptime)))
 	b.WriteString(fmt.Sprintf("<b>Load Average:</b> <code>%.2f</code> (1m) | <code>%.2f</code> (5m) | <code>%.2f</code> (15m)\n\n",
 		m.LoadAvg1, m.LoadAvg5, m.LoadAvg15))
@@ -149,19 +150,19 @@ func (r *Renderer) RenderStatus(m *system.Metrics, activeProfile string) string 
 	} else if m.MemPercent > 70 {
 		ramBadge = "🟡"
 	}
-	b.WriteString(fmt.Sprintf("<b>%s Memory (RAM):</b> <code>%.1f%%</code>\n", ramBadge, m.MemPercent))
+	b.WriteString(fmt.Sprintf("<b>%s Memory (RAM Limit 4 GB):</b> <code>%.1f%%</code>\n", ramBadge, m.MemPercent))
 	b.WriteString(fmt.Sprintf("  • Used: <code>%d MB</code> / <code>%d MB</code> (Free: <code>%d MB</code>)\n\n",
 		m.MemUsedMB, m.MemTotalMB, m.MemFreeMB))
 
 	diskBadge := "🟢"
-	if m.DiskPercent > 90 {
+	if m.DiskFreeGB < 5.0 {
 		diskBadge = "🔴"
-	} else if m.DiskPercent > 75 {
+	} else if m.DiskFreeGB < 15.0 {
 		diskBadge = "🟡"
 	}
-	b.WriteString(fmt.Sprintf("<b>%s Disk Storage:</b> <code>%.1f%%</code>\n", diskBadge, m.DiskPercent))
-	b.WriteString(fmt.Sprintf("  • Used: <code>%.1f GB</code> / <code>%.1f GB</code> (Free: <code>%.1f GB</code>)\n\n",
-		m.DiskUsedGB, m.DiskTotalGB, m.DiskFreeGB))
+	b.WriteString(fmt.Sprintf("<b>%s Storage Availability:</b>\n", diskBadge))
+	b.WriteString(fmt.Sprintf("  • Free Space Available: <code>%.1f GB</code>\n", m.DiskFreeGB))
+	b.WriteString(fmt.Sprintf("  • Partition Capacity: <code>%.1f GB</code>\n\n", m.DiskTotalGB))
 
 	b.WriteString("<b>⚡ Bot Memory Footprint (Super Ringan):</b>\n")
 	b.WriteString(fmt.Sprintf("  • Process Physical RSS: <code>%.1f MB</code>\n", m.BotRSSMB))

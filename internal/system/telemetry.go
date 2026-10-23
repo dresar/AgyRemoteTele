@@ -12,25 +12,26 @@ import (
 )
 
 type Metrics struct {
-	LoadAvg1     float64
-	LoadAvg5     float64
-	LoadAvg15    float64
-	MemTotalMB   uint64
-	MemUsedMB    uint64
-	MemFreeMB    uint64
-	MemPercent   float64
-	DiskTotalGB  float64
-	DiskUsedGB   float64
-	DiskFreeGB   float64
-	DiskPercent  float64
-	SystemUptime time.Duration
-	Goroutines   int
-	BotAllocMB   float64
-	BotSysMB     float64
-	BotRSSMB     float64
-	HeapInUseMB  float64
-	StackInUseMB float64
-	NumGC        uint32
+	AllocatedVCPU float64
+	LoadAvg1      float64
+	LoadAvg5      float64
+	LoadAvg15     float64
+	MemTotalMB    uint64
+	MemUsedMB     uint64
+	MemFreeMB     uint64
+	MemPercent    float64
+	DiskTotalGB   float64
+	DiskUsedGB    float64
+	DiskFreeGB    float64
+	DiskPercent   float64
+	SystemUptime  time.Duration
+	Goroutines    int
+	BotAllocMB    float64
+	BotSysMB      float64
+	BotRSSMB      float64
+	HeapInUseMB   float64
+	StackInUseMB  float64
+	NumGC         uint32
 }
 
 func CollectMetrics(diskPath string) (*Metrics, error) {
@@ -38,6 +39,7 @@ func CollectMetrics(diskPath string) (*Metrics, error) {
 		diskPath = "/"
 	}
 
+	vcpu := readCgroupCPU()
 	load1, load5, load15 := readLoadAvg()
 	memTotal, memUsed, memFree, memPct := readMemory()
 	diskTotal, diskUsed, diskFree, diskPct := readDisk(diskPath)
@@ -53,26 +55,42 @@ func CollectMetrics(diskPath string) (*Metrics, error) {
 	stackInUseMB := float64(m.StackInuse) / (1024 * 1024)
 
 	return &Metrics{
-		LoadAvg1:     load1,
-		LoadAvg5:     load5,
-		LoadAvg15:    load15,
-		MemTotalMB:   memTotal,
-		MemUsedMB:    memUsed,
-		MemFreeMB:    memFree,
-		MemPercent:   memPct,
-		DiskTotalGB:  diskTotal,
-		DiskUsedGB:   diskUsed,
-		DiskFreeGB:   diskFree,
-		DiskPercent:  diskPct,
-		SystemUptime: uptime,
-		Goroutines:   runtime.NumGoroutine(),
-		BotAllocMB:   botAllocMB,
-		BotSysMB:     botSysMB,
-		BotRSSMB:     rssMB,
-		HeapInUseMB:  heapInUseMB,
-		StackInUseMB: stackInUseMB,
-		NumGC:        m.NumGC,
+		AllocatedVCPU: vcpu,
+		LoadAvg1:      load1,
+		LoadAvg5:      load5,
+		LoadAvg15:     load15,
+		MemTotalMB:    memTotal,
+		MemUsedMB:     memUsed,
+		MemFreeMB:     memFree,
+		MemPercent:    memPct,
+		DiskTotalGB:   diskTotal,
+		DiskUsedGB:    diskUsed,
+		DiskFreeGB:    diskFree,
+		DiskPercent:   diskPct,
+		SystemUptime:  uptime,
+		Goroutines:    runtime.NumGoroutine(),
+		BotAllocMB:    botAllocMB,
+		BotSysMB:      botSysMB,
+		BotRSSMB:      rssMB,
+		HeapInUseMB:   heapInUseMB,
+		StackInUseMB:  stackInUseMB,
+		NumGC:         m.NumGC,
 	}, nil
+}
+
+func readCgroupCPU() float64 {
+	data, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err == nil {
+		fields := strings.Fields(strings.TrimSpace(string(data)))
+		if len(fields) >= 2 && fields[0] != "max" {
+			quota, errQ := strconv.ParseFloat(fields[0], 64)
+			period, errP := strconv.ParseFloat(fields[1], 64)
+			if errQ == nil && errP == nil && period > 0 {
+				return quota / period
+			}
+		}
+	}
+	return float64(runtime.NumCPU())
 }
 
 func readLoadAvg() (float64, float64, float64) {
@@ -93,6 +111,10 @@ func readLoadAvg() (float64, float64, float64) {
 }
 
 func readMemory() (uint64, uint64, uint64, float64) {
+	if totalMB, usedMB, freeMB, pct, ok := readCgroupMemory(); ok {
+		return totalMB, usedMB, freeMB, pct
+	}
+
 	file, err := os.Open("/proc/meminfo")
 	if err != nil {
 		return 0, 0, 0, 0
@@ -140,6 +162,61 @@ func readMemory() (uint64, uint64, uint64, float64) {
 	memPercent := (float64(memUsedKB) / float64(memTotalKB)) * 100.0
 
 	return memTotalMB, memUsedMB, memFreeMB, memPercent
+}
+
+func readCgroupMemory() (uint64, uint64, uint64, float64, bool) {
+	maxData, err := os.ReadFile("/sys/fs/cgroup/memory.max")
+	if err != nil {
+		maxData, err = os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+		if err != nil {
+			return 0, 0, 0, 0, false
+		}
+	}
+
+	maxStr := strings.TrimSpace(string(maxData))
+	if maxStr == "max" || maxStr == "" {
+		return 0, 0, 0, 0, false
+	}
+
+	limitBytes, err := strconv.ParseUint(maxStr, 10, 64)
+	if err != nil || limitBytes == 0 || limitBytes > 10000000000000 {
+		return 0, 0, 0, 0, false
+	}
+
+	var usedBytes uint64
+	if statData, err := os.ReadFile("/sys/fs/cgroup/memory.stat"); err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(statData)))
+		var anon, kernel uint64
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) == 2 {
+				val, _ := strconv.ParseUint(fields[1], 10, 64)
+				if fields[0] == "anon" {
+					anon = val
+				} else if fields[0] == "kernel" {
+					kernel = val
+				}
+			}
+		}
+		usedBytes = anon + kernel
+	}
+
+	if usedBytes == 0 {
+		if curData, err := os.ReadFile("/sys/fs/cgroup/memory.current"); err == nil {
+			usedBytes, _ = strconv.ParseUint(strings.TrimSpace(string(curData)), 10, 64)
+		}
+	}
+
+	if usedBytes > limitBytes {
+		usedBytes = limitBytes
+	}
+
+	totalMB := limitBytes / (1024 * 1024)
+	usedMB := usedBytes / (1024 * 1024)
+	freeMB := totalMB - usedMB
+	pct := (float64(usedBytes) / float64(limitBytes)) * 100.0
+
+	return totalMB, usedMB, freeMB, pct, true
 }
 
 func readDisk(path string) (float64, float64, float64, float64) {
