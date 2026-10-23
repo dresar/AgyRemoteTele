@@ -163,10 +163,12 @@ func (r *Renderer) RenderStatus(m *system.Metrics, activeProfile string) string 
 	b.WriteString(fmt.Sprintf("  • Used: <code>%.1f GB</code> / <code>%.1f GB</code> (Free: <code>%.1f GB</code>)\n\n",
 		m.DiskUsedGB, m.DiskTotalGB, m.DiskFreeGB))
 
-	b.WriteString("<b>⚡ Runtime Diagnostics:</b>\n")
-	b.WriteString(fmt.Sprintf("  • Active Goroutines: <code>%d</code>\n", m.Goroutines))
-	b.WriteString(fmt.Sprintf("  • Process Heap Alloc: <code>%.2f MB</code> (Sys: <code>%.2f MB</code>)\n",
-		m.BotAllocMB, m.BotSysMB))
+	b.WriteString("<b>⚡ Bot Memory Footprint (Super Ringan):</b>\n")
+	b.WriteString(fmt.Sprintf("  • Process Physical RSS: <code>%.1f MB</code>\n", m.BotRSSMB))
+	b.WriteString(fmt.Sprintf("  • Heap In-Use: <code>%.2f MB</code> (Alloc: <code>%.2f MB</code> | Sys: <code>%.2f MB</code>)\n",
+		m.HeapInUseMB, m.BotAllocMB, m.BotSysMB))
+	b.WriteString(fmt.Sprintf("  • Stack In-Use: <code>%.2f MB</code>\n", m.StackInUseMB))
+	b.WriteString(fmt.Sprintf("  • Active Goroutines: <code>%d</code> | GC Cycles: <code>%d</code>\n", m.Goroutines, m.NumGC))
 
 	return b.String()
 }

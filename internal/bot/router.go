@@ -86,6 +86,8 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
+	r.cleanupPreviousMessages(chatID, sess)
+
 	if strings.HasPrefix(text, "/resume_") {
 		convID := strings.TrimPrefix(text, "/resume_")
 		r.handleResume(chatID, sess, convID)
@@ -137,9 +139,19 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 	}
 }
 
-func (r *Router) handleStart(chatID int64, sess *session.Session) {
-	text := r.renderer.RenderWelcome(r.api.Self.UserName, sess.ActiveProfile, sess)
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+func (r *Router) cleanupPreviousMessages(chatID int64, sess *session.Session) {
+	if sess == nil || len(sess.LastBotMessageIDs) == 0 {
+		return
+	}
+	for _, msgID := range sess.LastBotMessageIDs {
+		del := tgbotapi.NewDeleteMessage(chatID, msgID)
+		_, _ = r.api.Request(del)
+	}
+	r.sessionStore.ClearLastBotMessageIDs(chatID)
+}
+
+func (r *Router) getStartMenuMarkup() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⚡ Status", "nav:status"),
 			tgbotapi.NewInlineKeyboardButtonData("👤 Profiles", "nav:profile"),
@@ -153,15 +165,31 @@ func (r *Router) handleStart(chatID int64, sess *session.Session) {
 			tgbotapi.NewInlineKeyboardButtonData("❓ Help", "nav:help"),
 		),
 	)
+}
+
+func (r *Router) getBackMarkup() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+		),
+	)
+}
+
+func (r *Router) handleStart(chatID int64, sess *session.Session) {
+	text := r.renderer.RenderWelcome(r.api.Self.UserName, sess.ActiveProfile, sess)
+	keyboard := r.getStartMenuMarkup()
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = keyboard
-	_, _ = r.api.Send(msg)
+	sent, err := r.api.Send(msg)
+	if err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
 }
 
 func (r *Router) handleHelp(chatID int64) {
-	r.replyHTML(chatID, r.renderer.RenderHelp())
+	r.replyHTMLWithBack(chatID, r.renderer.RenderHelp())
 }
 
 func (r *Router) handleLogin(chatID int64, text string) {
@@ -195,13 +223,13 @@ func (r *Router) handleProfile(chatID int64, sess *session.Session, targetProfil
 		}
 		oldProfile := sess.ActiveProfile
 		r.sessionStore.SetProfile(chatID, clean)
-		r.replyHTML(chatID, r.renderer.RenderProfileSwitched(oldProfile, clean))
+		r.replyHTMLWithBack(chatID, r.renderer.RenderProfileSwitched(oldProfile, clean))
 		return
 	}
 
 	profiles, err := r.profileManager.ListProfiles()
 	if err != nil || len(profiles) == 0 {
-		r.replyHTML(chatID, fmt.Sprintf("<b>Active Profile:</b> <code>%s</code>\nNo other profile directories discovered.", html.EscapeString(sess.ActiveProfile)))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>Active Profile:</b> <code>%s</code>\nNo other profile directories discovered.", html.EscapeString(sess.ActiveProfile)))
 		return
 	}
 
@@ -222,20 +250,26 @@ func (r *Router) handleProfile(chatID int64, sess *session.Session, targetProfil
 	if len(currentRow) > 0 {
 		rows = append(rows, currentRow)
 	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+	))
 
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("<b>👤 PROFILE SWITCHER</b>\n\nCurrent Active: 🟢 <code>%s</code>\nSelect worker profile:", html.EscapeString(sess.ActiveProfile)))
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	_, _ = r.api.Send(msg)
+	sent, err := r.api.Send(msg)
+	if err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
 }
 
 func (r *Router) handleHistory(chatID int64, sess *session.Session) {
 	items, err := r.historyReader.ListRecentConversations(sess.ActiveProfile, 8)
 	if err != nil {
-		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Error reading history:</b> %s", html.EscapeString(err.Error())))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Error reading history:</b> %s", html.EscapeString(err.Error())))
 		return
 	}
-	r.replyHTML(chatID, r.renderer.RenderHistory(sess.ActiveProfile, items))
+	r.replyHTMLWithBack(chatID, r.renderer.RenderHistory(sess.ActiveProfile, items))
 }
 
 func (r *Router) handleResume(chatID int64, sess *session.Session, convID string) {
@@ -246,22 +280,22 @@ func (r *Router) handleResume(chatID int64, sess *session.Session, convID string
 	}
 
 	r.sessionStore.SetConversation(chatID, cleanID)
-	r.replyHTML(chatID, fmt.Sprintf("<b>⚡ SESSION RESUMED</b>\n\nActive Conversation: <code>%s</code>\nProfile: <code>%s</code>\n\nSubsequent <code>/ask</code> instructions will continue this conversation.",
+	r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>⚡ SESSION RESUMED</b>\n\nActive Conversation: <code>%s</code>\nProfile: <code>%s</code>\n\nSubsequent <code>/ask</code> instructions will continue this conversation.",
 		html.EscapeString(cleanID), html.EscapeString(sess.ActiveProfile)))
 }
 
 func (r *Router) handleNew(chatID int64, sess *session.Session) {
 	r.sessionStore.ClearConversation(chatID)
-	r.replyHTML(chatID, fmt.Sprintf("<b>✨ NEW SESSION INITIALIZED</b>\n\nCleared active conversation context on <code>%s</code>. Next instruction will start fresh.", html.EscapeString(sess.ActiveProfile)))
+	r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>✨ NEW SESSION INITIALIZED</b>\n\nCleared active conversation context on <code>%s</code>. Next instruction will start fresh.", html.EscapeString(sess.ActiveProfile)))
 }
 
 func (r *Router) handleStatus(chatID int64, sess *session.Session) {
 	metrics, err := system.CollectMetrics(sess.ActiveWorkingDir)
 	if err != nil {
-		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Telemetry Error:</b> %s", html.EscapeString(err.Error())))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Telemetry Error:</b> %s", html.EscapeString(err.Error())))
 		return
 	}
-	r.replyHTML(chatID, r.renderer.RenderStatus(metrics, sess.ActiveProfile))
+	r.replyHTMLWithBack(chatID, r.renderer.RenderStatus(metrics, sess.ActiveProfile))
 }
 
 func (r *Router) handleLs(chatID int64, sess *session.Session, targetDir string) {
@@ -276,11 +310,11 @@ func (r *Router) handleLs(chatID int64, sess *session.Session, targetDir string)
 
 	items, err := workspace.ListDirectory(dir)
 	if err != nil {
-		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Directory Error:</b> %s", html.EscapeString(err.Error())))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Directory Error:</b> %s", html.EscapeString(err.Error())))
 		return
 	}
 
-	r.replyHTML(chatID, r.renderer.RenderFileList(dir, items))
+	r.replyHTMLWithBack(chatID, r.renderer.RenderFileList(dir, items))
 }
 
 func (r *Router) handleCd(chatID int64, sess *session.Session, targetDir string) {
@@ -303,7 +337,7 @@ func (r *Router) handleCd(chatID int64, sess *session.Session, targetDir string)
 	}
 
 	r.sessionStore.SetWorkingDir(chatID, dest)
-	r.replyHTML(chatID, fmt.Sprintf("<b>📁 Working directory updated:</b>\n<code>%s</code>", html.EscapeString(dest)))
+	r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>📁 Working directory updated:</b>\n<code>%s</code>", html.EscapeString(dest)))
 }
 
 func (r *Router) handleCat(chatID int64, sess *session.Session, targetFile string) {
@@ -407,20 +441,20 @@ func (r *Router) handleGit(ctx context.Context, chatID int64, sess *session.Sess
 		r.sendTyping(chatID)
 		out, err := workspace.CommitAndPush(ctx, repoPath, msg)
 		if err != nil {
-			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Git Sync Failed:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+			r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Git Sync Failed:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
 			return
 		}
-		r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Git Sync Successful:</b>\n<pre><code>%s</code></pre>", html.EscapeString(out)))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🟢 Git Sync Successful:</b>\n<pre><code>%s</code></pre>", html.EscapeString(out)))
 		return
 	}
 
 	summary, err := workspace.InspectRepository(repoPath)
 	if err != nil {
-		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Git Error:</b> %s", html.EscapeString(err.Error())))
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Git Error:</b> %s", html.EscapeString(err.Error())))
 		return
 	}
 
-	r.replyHTML(chatID, r.renderer.RenderGitSummary(summary))
+	r.replyHTMLWithBack(chatID, r.renderer.RenderGitSummary(summary))
 }
 
 func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Session, prompt string) {
@@ -480,17 +514,33 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 	rep := reporter.BuildReport(sess.ActiveProfile, result, sess.ActiveWorkingDir)
 	reportHTML := rep.RenderHTML()
 
-	r.replyHTML(chatID, reportHTML)
+	var sentIDs []int
+
+	msgRep := tgbotapi.NewMessage(chatID, reportHTML)
+	msgRep.ParseMode = tgbotapi.ModeHTML
+	if sent, err := r.api.Send(msgRep); err == nil {
+		sentIDs = append(sentIDs, sent.MessageID)
+	}
 
 	if result.Response != "" {
 		respHeader := fmt.Sprintf("<b>💬 Agent Response:</b>\n\n%s", html.EscapeString(result.Response))
-		r.replyChunks(chatID, respHeader)
+		chunks := r.renderer.ChunkMessage(respHeader, 4000)
+		for _, chunk := range chunks {
+			msg := tgbotapi.NewMessage(chatID, chunk)
+			msg.ParseMode = tgbotapi.ModeHTML
+			if sent, err := r.api.Send(msg); err == nil {
+				sentIDs = append(sentIDs, sent.MessageID)
+			}
+		}
 	}
+
+	r.sessionStore.SetLastBotMessageIDs(chatID, sentIDs)
 }
 
 func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	data := cb.Data
 	chatID := cb.Message.Chat.ID
+	msgID := cb.Message.MessageID
 	username := cb.From.UserName
 
 	sess, authorized, _ := r.middleware.ProcessAccess(chatID, username, false)
@@ -503,46 +553,137 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 	callbackResp := tgbotapi.NewCallback(cb.ID, "")
 	_, _ = r.api.Request(callbackResp)
 
+	if data == "nav:start" {
+		text := r.renderer.RenderWelcome(r.api.Self.UserName, sess.ActiveProfile, sess)
+		markup := r.getStartMenuMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+		return
+	}
+
 	if strings.HasPrefix(data, "profile:") {
 		target := strings.TrimPrefix(data, "profile:")
-		r.handleProfile(chatID, sess, target)
+		oldProfile := sess.ActiveProfile
+		r.sessionStore.SetProfile(chatID, target)
+		text := r.renderer.RenderProfileSwitched(oldProfile, target)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
 		return
 	}
 
 	if strings.HasPrefix(data, "resume:") {
 		target := strings.TrimPrefix(data, "resume:")
-		r.handleResume(chatID, sess, target)
+		r.sessionStore.SetConversation(chatID, target)
+		text := fmt.Sprintf("<b>⚡ SESSION RESUMED</b>\n\nActive Conversation: <code>%s</code>\nProfile: <code>%s</code>",
+			html.EscapeString(target), html.EscapeString(sess.ActiveProfile))
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
 		return
 	}
 
 	switch data {
 	case "nav:status":
-		r.handleStatus(chatID, sess)
+		metrics, err := system.CollectMetrics(sess.ActiveWorkingDir)
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Telemetry Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderStatus(metrics, sess.ActiveProfile)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
 	case "nav:profile":
-		r.handleProfile(chatID, sess, "")
+		profiles, _ := r.profileManager.ListProfiles()
+		var rows [][]tgbotapi.InlineKeyboardButton
+		var currentRow []tgbotapi.InlineKeyboardButton
+		for _, p := range profiles {
+			label := p
+			if p == sess.ActiveProfile {
+				label = "🟢 " + p
+			}
+			btn := tgbotapi.NewInlineKeyboardButtonData(label, "profile:"+p)
+			currentRow = append(currentRow, btn)
+			if len(currentRow) == 4 {
+				rows = append(rows, currentRow)
+				currentRow = nil
+			}
+		}
+		if len(currentRow) > 0 {
+			rows = append(rows, currentRow)
+		}
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+		))
+		markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+		text := fmt.Sprintf("<b>👤 PROFILE SWITCHER</b>\n\nCurrent Active: 🟢 <code>%s</code>\nSelect worker profile:", html.EscapeString(sess.ActiveProfile))
+		r.editMessage(chatID, msgID, text, &markup)
+
 	case "nav:history":
-		r.handleHistory(chatID, sess)
+		items, _ := r.historyReader.ListRecentConversations(sess.ActiveProfile, 6)
+		text := r.renderer.RenderHistory(sess.ActiveProfile, items)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
 	case "nav:ls":
-		r.handleLs(chatID, sess, "")
+		items, _ := workspace.ListDirectory(sess.ActiveWorkingDir)
+		text := r.renderer.RenderFileList(sess.ActiveWorkingDir, items)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
 	case "nav:git":
-		r.handleGit(ctx, chatID, sess, "")
+		summary, _ := workspace.InspectRepository(sess.ActiveWorkingDir)
+		text := r.renderer.RenderGitSummary(summary)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
 	case "nav:help":
-		r.handleHelp(chatID)
+		text := r.renderer.RenderHelp()
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
 	}
+}
+
+func (r *Router) editMessage(chatID int64, msgID int, text string, markup *tgbotapi.InlineKeyboardMarkup) {
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = tgbotapi.ModeHTML
+	if markup != nil {
+		edit.ReplyMarkup = markup
+	}
+	_, _ = r.api.Request(edit)
 }
 
 func (r *Router) replyHTML(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
-	_, _ = r.api.Send(msg)
+	sent, err := r.api.Send(msg)
+	if err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
+}
+
+func (r *Router) replyHTMLWithBack(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	markup := r.getBackMarkup()
+	msg.ReplyMarkup = markup
+	sent, err := r.api.Send(msg)
+	if err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
 }
 
 func (r *Router) replyChunks(chatID int64, text string) {
 	chunks := r.renderer.ChunkMessage(text, 4000)
+	var ids []int
 	for _, chunk := range chunks {
 		msg := tgbotapi.NewMessage(chatID, chunk)
 		msg.ParseMode = tgbotapi.ModeHTML
-		_, _ = r.api.Send(msg)
+		if sent, err := r.api.Send(msg); err == nil {
+			ids = append(ids, sent.MessageID)
+		}
+	}
+	if len(ids) > 0 {
+		r.sessionStore.SetLastBotMessageIDs(chatID, ids)
 	}
 }
 
@@ -553,7 +694,9 @@ func (r *Router) sendTyping(chatID int64) {
 
 func (r *Router) sendDocument(chatID int64, filePath string) {
 	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
-	_, _ = r.api.Send(doc)
+	if sent, err := r.api.Send(doc); err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
 }
 
 func truncateString(s string, max int) string {

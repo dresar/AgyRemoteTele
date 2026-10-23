@@ -17,6 +17,8 @@ type Session struct {
 	ActiveProfile        string    `json:"active_profile"`
 	ActiveConversationID string    `json:"active_conversation_id"`
 	ActiveWorkingDir     string    `json:"active_working_dir"`
+	LastBotMessageIDs    []int     `json:"last_bot_message_ids"`
+	LastUserMessageID    int       `json:"last_user_message_id"`
 }
 
 type Store struct {
@@ -165,6 +167,36 @@ func (s *Store) IsExpired(sess *Session, maxAge time.Duration) bool {
 		return false
 	}
 	return time.Since(sess.LastActiveAt) > maxAge
+}
+
+func (s *Store) SetLastBotMessageIDs(chatID int64, ids []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sess, ok := s.sessions[chatID]; ok {
+		sess.LastBotMessageIDs = ids
+		_ = s.saveLocked()
+	}
+}
+
+func (s *Store) ClearLastBotMessageIDs(chatID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sess, ok := s.sessions[chatID]; ok {
+		sess.LastBotMessageIDs = nil
+		_ = s.saveLocked()
+	}
+}
+
+func (s *Store) SetLastUserMessageID(chatID int64, id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sess, ok := s.sessions[chatID]; ok {
+		sess.LastUserMessageID = id
+		_ = s.saveLocked()
+	}
 }
 
 func (s *Store) Persist() error {

@@ -27,6 +27,10 @@ type Metrics struct {
 	Goroutines   int
 	BotAllocMB   float64
 	BotSysMB     float64
+	BotRSSMB     float64
+	HeapInUseMB  float64
+	StackInUseMB float64
+	NumGC        uint32
 }
 
 func CollectMetrics(diskPath string) (*Metrics, error) {
@@ -38,12 +42,15 @@ func CollectMetrics(diskPath string) (*Metrics, error) {
 	memTotal, memUsed, memFree, memPct := readMemory()
 	diskTotal, diskUsed, diskFree, diskPct := readDisk(diskPath)
 	uptime := readUptime()
+	rssMB := readProcessRSS()
 
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
 	botAllocMB := float64(m.Alloc) / (1024 * 1024)
 	botSysMB := float64(m.Sys) / (1024 * 1024)
+	heapInUseMB := float64(m.HeapInuse) / (1024 * 1024)
+	stackInUseMB := float64(m.StackInuse) / (1024 * 1024)
 
 	return &Metrics{
 		LoadAvg1:     load1,
@@ -61,6 +68,10 @@ func CollectMetrics(diskPath string) (*Metrics, error) {
 		Goroutines:   runtime.NumGoroutine(),
 		BotAllocMB:   botAllocMB,
 		BotSysMB:     botSysMB,
+		BotRSSMB:     rssMB,
+		HeapInUseMB:  heapInUseMB,
+		StackInUseMB: stackInUseMB,
+		NumGC:        m.NumGC,
 	}, nil
 }
 
@@ -170,6 +181,29 @@ func readUptime() time.Duration {
 	}
 
 	return time.Duration(secs * float64(time.Second))
+}
+
+func readProcessRSS() float64 {
+	file, err := os.Open("/proc/self/status")
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "VmRSS:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				valKB, err := strconv.ParseFloat(fields[1], 64)
+				if err == nil {
+					return valKB / 1024.0
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func FormatUptime(d time.Duration) string {
