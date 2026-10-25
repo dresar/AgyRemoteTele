@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -115,6 +116,10 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		r.handleAsk(ctx, chatID, sess, args)
 	case "profile":
 		r.handleProfile(chatID, sess, args)
+	case "accounts", "workers":
+		r.handleAccounts(ctx, chatID)
+	case "refresh":
+		r.handleRefresh(ctx, chatID)
 	case "history":
 		r.handleHistory(chatID, sess)
 	case "resume":
@@ -160,6 +165,10 @@ func (r *Router) getStartMenuMarkup() tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⚡ Status", "nav:status"),
 			tgbotapi.NewInlineKeyboardButtonData("👤 Profiles", "nav:profile"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Accounts", "nav:accounts"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "nav:refresh"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📜 History", "nav:history"),
@@ -492,9 +501,24 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 		}
 	}()
 
+	wrappedPrompt := fmt.Sprintf(`[TELEGRAM AGY REMOTE GATEWAY — OPERATOR REQUEST]
+Pengirim: Telegram Operator (Chat ID: %d)
+Worker Profil: %s
+Working Directory: %s
+
+INSTRUKSI PENGGUNA:
+%s
+
+STANDAR OPERASIONAL (ZERO TOLERANCE):
+1. Pahami instruksi dan eksekusi tindakan yang diperlukan secara presisi.
+2. STANDAR NOKOMEN: Jangan menulis komentar dalam kode yang dibuat/diedit.
+3. QUALITY GATE: Pastikan kode bebas dari error kompilasi/sintaks.
+4. FORMAT RESPON TELEGRAM: Berikan jawaban akhir yang SINGKAT, PADAT, dan TO-THE-POINT mengenai apa yang telah dikerjakan, status perubahan, dan verifikasi. Hindari narasi panjang bertele-tele.`,
+		chatID, sess.ActiveProfile, sess.ActiveWorkingDir, cleanPrompt)
+
 	req := agy.ExecutionRequest{
 		Profile:        sess.ActiveProfile,
-		Prompt:         cleanPrompt,
+		Prompt:         wrappedPrompt,
 		ConversationID: sess.ActiveConversationID,
 		WorkingDir:     sess.ActiveWorkingDir,
 	}
@@ -540,6 +564,146 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 	}
 
 	r.sessionStore.SetLastBotMessageIDs(chatID, sentIDs)
+}
+
+func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
+	r.sendTyping(chatID)
+
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "status")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Accounts Status Error:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	type accInfo struct {
+		name      string
+		status    string
+		remaining string
+		email     string
+		active    bool
+	}
+
+	var accounts []accInfo
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, "|") {
+			continue
+		}
+		parts := strings.Split(trimmed, "|")
+		if len(parts) != 4 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		if !strings.HasPrefix(strings.ToLower(name), "agy") {
+			continue
+		}
+		status := strings.TrimSpace(parts[1])
+		remaining := strings.TrimSpace(parts[2])
+		email := strings.TrimSpace(parts[3])
+		isActive := strings.EqualFold(status, "Aktif")
+
+		accounts = append(accounts, accInfo{
+			name:      name,
+			status:    status,
+			remaining: remaining,
+			email:     email,
+			active:    isActive,
+		})
+	}
+
+	if len(accounts) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>👥 AGY WORKER ACCOUNTS</b>\n\n<pre><code>%s</code></pre>", html.EscapeString(string(out))))
+		return
+	}
+
+	activeCount := 0
+	for _, acc := range accounts {
+		if acc.active {
+			activeCount++
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("<b>👥 AGY WORKER ACCOUNTS (01 - 10)</b>\nActive: <code>%d/%d</code> Workers\n\n", activeCount, len(accounts)))
+
+	for _, acc := range accounts {
+		emoji := "🔴"
+		if acc.active {
+			emoji = "🟢"
+		}
+		b.WriteString(fmt.Sprintf("%s <b>%s</b> • <b>%s</b>\n", emoji, html.EscapeString(acc.name), html.EscapeString(acc.status)))
+		b.WriteString(fmt.Sprintf("  ├ ⏱ <code>%s</code>\n", html.EscapeString(acc.remaining)))
+		b.WriteString(fmt.Sprintf("  └ 📧 <code>%s</code>\n\n", html.EscapeString(acc.email)))
+	}
+
+	r.replyHTMLWithBack(chatID, strings.TrimRight(b.String(), "\n"))
+}
+
+func (r *Router) handleRefresh(ctx context.Context, chatID int64) {
+	r.sendTyping(chatID)
+
+	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	typingDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-typingDone:
+				return
+			case <-ticker.C:
+				r.sendTyping(chatID)
+			}
+		}
+	}()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "refresh")
+	out, err := cmd.CombinedOutput()
+	close(typingDone)
+
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Refresh Execution Failed:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	var items []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[agy") {
+			emoji := "🟢"
+			if strings.Contains(trimmed, "Gagal") || strings.Contains(trimmed, "Error") {
+				emoji = "🔴"
+			} else if strings.Contains(trimmed, "Dilewati") {
+				emoji = "⚪"
+			}
+			items = append(items, fmt.Sprintf("%s <code>%s</code>", emoji, html.EscapeString(trimmed)))
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("<b>🔄 AGY WORKER TOKENS REFRESH</b>\n\n")
+
+	if len(items) > 0 {
+		b.WriteString(strings.Join(items, "\n"))
+	} else if len(out) > 0 {
+		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(string(out))))
+	} else {
+		b.WriteString("<i>Command completed with no output.</i>")
+	}
+
+	if err != nil {
+		b.WriteString(fmt.Sprintf("\n\n<b>Notice:</b> <code>%s</code>", html.EscapeString(err.Error())))
+	}
+
+	r.replyHTMLWithBack(chatID, b.String())
 }
 
 func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQuery) {
@@ -596,6 +760,12 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 		}
 		markup := r.getBackMarkup()
 		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:accounts":
+		r.handleAccounts(ctx, chatID)
+
+	case "nav:refresh":
+		r.handleRefresh(ctx, chatID)
 
 	case "nav:profile":
 		profiles, _ := r.profileManager.ListProfiles()
