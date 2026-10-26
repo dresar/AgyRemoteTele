@@ -34,6 +34,17 @@ type ActiveTask struct {
 	Profile   string
 	Prompt    string
 	StartedAt time.Time
+	Killed    bool
+}
+
+var (
+	reToolBullet        = regexp.MustCompile(`^[•\-\*]\s*(?:<code>)?(?:run_command|read_file|write_to_file|replace_file_content|find_by_name|grep_search|list_dir|view_file|read_url_content|search_web|manage_task|schedule|send_message|ask_permission|ask_question|generate_image)`)
+	reExecSummaryPrefix = regexp.MustCompile(`(?i)^(?:<blockquote>)?(?:<b>)?Executive Summary:?\s*(?:</b>)?`)
+	reMultiNL           = regexp.MustCompile(`\n{3,}`)
+)
+
+func isToolBullet(line string) bool {
+	return reToolBullet.MatchString(line)
 }
 
 type Router struct {
@@ -288,18 +299,29 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 				r.handleUp(ctx, chatID, upArg)
 				return
 			}
+			if lowerText == "new" || strings.HasPrefix(lowerText, "new ") {
+				newArg := strings.TrimSpace(text[len("new"):])
+				r.handleNew(ctx, chatID, sess, newArg)
+				return
+			}
 			if strings.HasPrefix(lowerText, "boost") || strings.HasPrefix(lowerText, "learn") {
 				boostArg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "boost"), "learn"))
 				r.handleBoost(ctx, chatID, sess, boostArg)
 				return
 			}
-			if strings.HasPrefix(lowerText, "plan ") {
-				planArg := strings.TrimSpace(text[len("plan "):])
+			if lowerText == "plan" || strings.HasPrefix(lowerText, "plan ") {
+				planArg := ""
+				if strings.HasPrefix(lowerText, "plan ") {
+					planArg = strings.TrimSpace(text[len("plan "):])
+				}
 				r.handlePlan(ctx, chatID, sess, planArg)
 				return
 			}
-			if strings.HasPrefix(lowerText, "teamwork ") {
-				twArg := strings.TrimSpace(text[len("teamwork "):])
+			if lowerText == "teamwork" || strings.HasPrefix(lowerText, "teamwork ") {
+				twArg := ""
+				if strings.HasPrefix(lowerText, "teamwork ") {
+					twArg = strings.TrimSpace(text[len("teamwork "):])
+				}
 				r.handleTeamwork(ctx, chatID, sess, twArg)
 				return
 			}
@@ -458,6 +480,7 @@ func (r *Router) handleResume(chatID int64, sess *session.Session, convID string
 }
 
 func (r *Router) handleNew(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	sess.ActiveConversationID = ""
 	r.sessionStore.ClearConversation(chatID)
 	cleanArgs := strings.TrimSpace(args)
 	if cleanArgs != "" {
@@ -468,6 +491,13 @@ func (r *Router) handleNew(ctx context.Context, chatID int64, sess *session.Sess
 }
 
 func (r *Router) handleContinue(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	if sess.ActiveConversationID == "" && r.historyReader != nil {
+		if items, err := r.historyReader.ListRecentConversations(sess.ActiveProfile, 1); err == nil && len(items) > 0 && items[0].ConversationID != "" {
+			sess.ActiveConversationID = items[0].ConversationID
+			r.sessionStore.SetConversation(chatID, items[0].ConversationID)
+		}
+	}
+
 	if sess.ActiveConversationID == "" {
 		r.replyHTMLWithBack(chatID, "<b>ℹ️ Belum Ada Percakapan Aktif</b>\n\nTidak ada percakapan aktif yang dapat dilanjutkan.\nKetik <code>/ask &lt;pesan&gt;</code> untuk memulai percakapan baru.")
 		return
@@ -540,9 +570,16 @@ func (r *Router) handleTools(chatID int64) {
 }
 
 func (r *Router) handleKillCommand(chatID int64, args string) {
+	cleanArgs := strings.TrimSpace(args)
+	if cleanArgs != "" {
+		r.handleKill(chatID, cleanArgs)
+		return
+	}
+
 	r.activeTasksMu.Lock()
 	activeTask, exists := r.activeTasks[chatID]
 	if exists {
+		activeTask.Killed = true
 		delete(r.activeTasks, chatID)
 		r.activeTasksMu.Unlock()
 		activeTask.Cancel()
@@ -550,11 +587,6 @@ func (r *Router) handleKillCommand(chatID int64, args string) {
 		return
 	}
 	r.activeTasksMu.Unlock()
-
-	if strings.TrimSpace(args) != "" {
-		r.handleKill(chatID, args)
-		return
-	}
 
 	r.replyHTML(chatID, "ℹ️ <i>Tidak ada tugas Antigravity yang sedang berjalan pada sesi ini.</i>\n\nUntuk menghentikan proses sistem VPS tertentu, gunakan: <code>/kill &lt;pid&gt; [signal]</code>")
 }
@@ -733,62 +765,145 @@ func cleanAgentResponse(resp string) string {
 		return ""
 	}
 
-	if strings.Contains(trimmed, "⚡ TASK EXECUTION COMPLETED") {
-		idx := strings.Index(trimmed, "⚡ TASK EXECUTION COMPLETED")
-		before := strings.TrimSpace(trimmed[:idx])
-		after := trimmed[idx:]
-		lines := strings.Split(after, "\n")
-		var rest []string
-		skip := true
-		for _, line := range lines {
-			trimmedLine := strings.TrimSpace(line)
-			if skip {
-				if strings.HasPrefix(trimmedLine, "⚡ TASK EXECUTION COMPLETED") ||
-					strings.HasPrefix(trimmedLine, "Profile:") ||
-					strings.HasPrefix(trimmedLine, "Duration:") ||
-					strings.HasPrefix(trimmedLine, "Executive Summary:") ||
-					strings.HasPrefix(trimmedLine, "🛠 Tools Invoked:") ||
-					strings.HasPrefix(trimmedLine, "• ") ||
-					strings.HasPrefix(trimmedLine, "- ") ||
-					strings.HasPrefix(trimmedLine, "Session ID:") ||
-					strings.HasPrefix(trimmedLine, "📁 File Changes:") ||
-					trimmedLine == "" {
-					continue
-				}
-				skip = false
-			}
-			rest = append(rest, line)
-		}
-		candidate := strings.TrimSpace(strings.Join(rest, "\n"))
-		if candidate != "" {
-			trimmed = candidate
-		} else if before != "" {
-			trimmed = before
-		}
-	}
+	lines := strings.Split(trimmed, "\n")
+	var cleaned []string
+	inTools := false
+	inFileChanges := false
+	inQuote := false
+	var quoteChar rune
 
-	if strings.Contains(trimmed, "🛠 Tools Invoked:") {
-		lines := strings.Split(trimmed, "\n")
-		var cleanLines []string
-		inTools := false
-		for _, line := range lines {
-			if strings.Contains(line, "🛠 Tools Invoked:") {
-				inTools = true
+	for _, line := range lines {
+		tLine := strings.TrimSpace(line)
+		lowerLine := strings.ToLower(tLine)
+
+		if strings.Contains(tLine, "TASK EXECUTION COMPLETED") {
+			continue
+		}
+
+		if strings.HasPrefix(lowerLine, "profile:") || strings.HasPrefix(lowerLine, "<b>profile:</b>") {
+			continue
+		}
+		if strings.HasPrefix(lowerLine, "duration:") || strings.HasPrefix(lowerLine, "<b>duration:</b>") {
+			continue
+		}
+
+		if strings.HasPrefix(lowerLine, "session id:") ||
+			strings.HasPrefix(lowerLine, "<b>session id:</b>") ||
+			strings.HasPrefix(lowerLine, "<i>session id:</i>") ||
+			strings.Contains(lowerLine, "session id: ") {
+			inTools = false
+			inFileChanges = false
+			inQuote = false
+			continue
+		}
+
+		if strings.Contains(tLine, "File Changes:") || strings.Contains(tLine, "📁 File Changes:") {
+			inFileChanges = true
+			inTools = false
+			inQuote = false
+			continue
+		}
+
+		if strings.Contains(tLine, "Tools Invoked:") || strings.Contains(tLine, "🛠 Tools Invoked:") {
+			inTools = true
+			inFileChanges = false
+			inQuote = false
+			continue
+		}
+
+		if strings.EqualFold(tLine, "Executive Summary:") ||
+			strings.EqualFold(tLine, "<b>Executive Summary:</b>") ||
+			strings.EqualFold(tLine, "<blockquote><b>Executive Summary:</b>") ||
+			strings.EqualFold(tLine, "<blockquote><b>Executive Summary:</b></blockquote>") {
+			continue
+		}
+
+		if reExecSummaryPrefix.MatchString(tLine) {
+			cleanLine := strings.TrimSpace(reExecSummaryPrefix.ReplaceAllString(line, ""))
+			if cleanLine != "" {
+				cleaned = append(cleaned, cleanLine)
+			}
+			continue
+		}
+
+		if tLine == "<blockquote>" || tLine == "</blockquote>" {
+			continue
+		}
+
+		if inFileChanges {
+			if strings.HasPrefix(tLine, "#") ||
+				strings.HasPrefix(lowerLine, "session id:") ||
+				strings.HasPrefix(lowerLine, "executive summary:") {
+				inFileChanges = false
+			} else {
 				continue
 			}
-			if inTools {
-				trimmedLine := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmedLine, "•") || strings.HasPrefix(trimmedLine, "-") || trimmedLine == "" {
+		}
+
+		if inTools {
+			if strings.HasPrefix(tLine, "#") ||
+				strings.HasPrefix(lowerLine, "session id:") ||
+				strings.HasPrefix(lowerLine, "executive summary:") ||
+				strings.Contains(tLine, "File Changes:") ||
+				strings.HasPrefix(lowerLine, "summary:") ||
+				strings.HasPrefix(lowerLine, "hasil:") ||
+				strings.HasPrefix(lowerLine, "kesimpulan:") ||
+				strings.HasPrefix(lowerLine, "ringkasan:") ||
+				strings.HasPrefix(lowerLine, "result:") {
+				inTools = false
+				inQuote = false
+			} else if inQuote {
+				if (quoteChar != 0 && strings.Count(tLine, string(quoteChar))%2 != 0) ||
+					strings.HasSuffix(tLine, "(PASS)") ||
+					strings.HasSuffix(tLine, "(FAIL)") ||
+					strings.HasSuffix(tLine, "(DONE)") {
+					inQuote = false
+					quoteChar = 0
+				}
+				continue
+			} else if tLine != "" {
+				isBullet := strings.HasPrefix(tLine, "•") || strings.HasPrefix(tLine, "-") || strings.HasPrefix(tLine, "*")
+				if !isBullet {
+					inTools = false
+				} else {
+					dQuotes := strings.Count(tLine, "\"")
+					sQuotes := strings.Count(tLine, "'")
+					if dQuotes%2 != 0 {
+						inQuote = true
+						quoteChar = '"'
+					} else if sQuotes%2 != 0 {
+						inQuote = true
+						quoteChar = '\''
+					}
 					continue
 				}
-				inTools = false
+			} else {
+				continue
 			}
-			cleanLines = append(cleanLines, line)
 		}
-		trimmed = strings.TrimSpace(strings.Join(cleanLines, "\n"))
+
+		if !inTools {
+			if isToolBullet(tLine) {
+				dQuotes := strings.Count(tLine, "\"")
+				sQuotes := strings.Count(tLine, "'")
+				if dQuotes%2 != 0 {
+					inTools = true
+					inQuote = true
+					quoteChar = '"'
+				} else if sQuotes%2 != 0 {
+					inTools = true
+					inQuote = true
+					quoteChar = '\''
+				}
+				continue
+			}
+		}
+
+		cleaned = append(cleaned, line)
 	}
 
-	return trimmed
+	res := strings.TrimSpace(strings.Join(cleaned, "\n"))
+	return reMultiNL.ReplaceAllString(res, "\n\n")
 }
 
 func wrapPrompt(chatID int64, profile string, workingDir string, prompt string) string {
@@ -835,12 +950,13 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 	}
 
 	execCtx, cancel := context.WithTimeout(ctx, r.execTimeout)
-	r.activeTasks[chatID] = &ActiveTask{
+	activeTask := &ActiveTask{
 		Cancel:    cancel,
 		Profile:   sess.ActiveProfile,
 		Prompt:    cleanPrompt,
 		StartedAt: time.Now(),
 	}
+	r.activeTasks[chatID] = activeTask
 	r.activeTasksMu.Unlock()
 
 	defer func() {
@@ -894,7 +1010,13 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 	}
 
 	if execCtx.Err() == context.Canceled {
-		r.replyHTML(chatID, fmt.Sprintf("🛑 <b>PROSES DIHENTIKAN</b>\n\nTugas Antigravity pada profil <code>%s</code> telah dihentikan atas permintaan pengguna (/kill).", html.EscapeString(sess.ActiveProfile)))
+		if !activeTask.Killed {
+			r.replyHTML(chatID, fmt.Sprintf("🛑 <b>TUGAS DIBATALKAN</b>\n\nTugas Antigravity pada profil <code>%s</code> dibatalkan.", html.EscapeString(sess.ActiveProfile)))
+		}
+		return
+	}
+	if execCtx.Err() == context.DeadlineExceeded {
+		r.replyHTML(chatID, fmt.Sprintf("⏱️ <b>BATAS WAKTU TERCAPAI (TIMEOUT)</b>\n\nTugas Antigravity pada profil <code>%s</code> melebihi batas waktu eksekusi.", html.EscapeString(sess.ActiveProfile)))
 		return
 	}
 

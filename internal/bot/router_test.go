@@ -551,7 +551,7 @@ func TestCleanAgentResponse(t *testing.T) {
 		t.Errorf("cleanAgentResponse(%q) = %q, expected unchanged", rawNormal, got)
 	}
 
-	rawLeaked := `⚡ TASK EXECUTION COMPLETED
+	rawMultilinePython := `⚡ TASK EXECUTION COMPLETED
 Profile: agy10 | Duration: 206.2s
 
 Executive Summary:
@@ -560,37 +560,96 @@ Hasil pengecekan riwayat chat untuk Telegram Operator (Chat ID: 8638950192):
 🛠 Tools Invoked:
 • run_command: ls -la /opt/data/home/AgyRemoteTele/data (PASS)
 • read_file: /opt/data/home/AgyRemoteTele/data/sessions.json
+• run_command: ls -la /opt/data/home/agy-profiles/agy10/.gemini/antigravity-cli/brain/99323ee4-56fa-4204-b709-801578eff3d1/.system_generated/logs/ (PASS)
+• run_command: python3 -c "
+import json
+with open('/opt/data/home/agy-profiles/agy10/.gemini/antigravity-cli/brain/99323ee4-56fa-4204-b709-801578eff3d1/.system_generated/logs/transcript.jsonl') as f:
+    for i, line in enumerate(f):
+        data = json.loads(line)
+        stype = data.get('type')
+        created_at = data.get('created_at')
+        if stype == 'USER_INPUT':
+            content = data.get('content', '')
+            print(f'Step {i} [{created_at}] USER_INPUT: {content[:100]}...')
+        elif stype == 'PLANN… (PASS)
 • run_command: ls -la /opt/data/home/agy-profiles/agy10/.gemini/antigravity-cli/brain/ (PASS)
+• run_command: grep -n "8638950192" /opt/data/home/AgyRemoteTele/data/bot.log | head -n 30 (PASS)
+• run_command: tail -n 60 /opt/data/home/AgyRemoteTele/data/bot.log (FAIL)
+• run_command: ls -la /opt/data/home/AgyRemoteTele/data/backups/ (PASS)
+• run_command: tar -tzf /opt/data/home/AgyRemoteTele/data/backups/backup_20261026_083227.tar.gz (PASS)
+• run_command: tar -xzf /opt/data/home/AgyRemoteTele/data/backups/backup_20261026_083227.tar.gz -O 001/sessions.json (PASS)
+• run_command: python3 -c "
+import json
+with open('/opt/data/home/agy-profiles/agy10/.gemini/antigravity-cli/brain/99323ee4-56fa-4204-b709-801578eff3d1/.system_generated/logs/transcript.jsonl') as f:
+    for i, line in enumerate(f):
+        data = json.loads(line)
+        if data.get('type') == 'USER_INPUT':
+            print(f'=== Step {i} at {data.get(\"created_at\")} ===')
+            print(data.get('content'))
+" (FAIL)
+• run_command: python3 -c "
+import glob, json, os
+
+profiles = glob.glob('/opt/data/home/agy-profiles/' + '*' + '/.gemini/antigravity-cli/brain/' + '*' + '/.system_generated/logs/transcript.jsonl')
+found = []
+for p in profiles:
+    try:
+        with open(p, 'r') as f:
+            first_line = f.readline()
+            if '8638950192' in first_line:
+                conv_id = p.split('/brain/')[1].split('/')[0]
+                worker = p.split('agy-profiles/')[1].split('/')[0]
+                mtime = os.path.getmtime(p)
+                found.app… (PASS)
 
 Session ID: 99323ee4-56fa-4204-b709-801578eff3d1
 
-Jawaban akhir yang sesungguhnya sudah siap.`
+Riwayat percakapan berhasil ditemukan dan siap dianalisis.`
 
-	got := cleanAgentResponse(rawLeaked)
-	if strings.Contains(got, "⚡ TASK EXECUTION COMPLETED") {
-		t.Errorf("expected header to be stripped, got: %s", got)
+	gotMultiline := cleanAgentResponse(rawMultilinePython)
+	if strings.Contains(gotMultiline, "TASK EXECUTION COMPLETED") {
+		t.Errorf("expected TASK EXECUTION COMPLETED to be stripped, got: %s", gotMultiline)
 	}
-	if strings.Contains(got, "🛠 Tools Invoked:") {
-		t.Errorf("expected tools invoked block to be stripped, got: %s", got)
+	if strings.Contains(gotMultiline, "Tools Invoked:") {
+		t.Errorf("expected Tools Invoked to be stripped, got: %s", gotMultiline)
 	}
-	if !strings.Contains(got, "Jawaban akhir yang sesungguhnya sudah siap.") {
-		t.Errorf("expected clean final response to be preserved, got: %s", got)
+	if strings.Contains(gotMultiline, "import json") || strings.Contains(gotMultiline, "run_command:") {
+		t.Errorf("expected multiline python commands to be stripped, got: %s", gotMultiline)
+	}
+	if strings.Contains(gotMultiline, "Session ID:") {
+		t.Errorf("expected Session ID to be stripped, got: %s", gotMultiline)
+	}
+	if !strings.Contains(gotMultiline, "Hasil pengecekan riwayat chat untuk Telegram Operator (Chat ID: 8638950192):") {
+		t.Errorf("expected summary text to be preserved, got: %s", gotMultiline)
+	}
+	if !strings.Contains(gotMultiline, "Riwayat percakapan berhasil ditemukan dan siap dianalisis.") {
+		t.Errorf("expected final answer to be preserved, got: %s", gotMultiline)
 	}
 
-	rawToolsOnly := `Langkah awal berhasil.
+	rawHTML := `<b>⚡ TASK EXECUTION COMPLETED</b>
+<b>Profile:</b> <code>agy10</code> | <b>Duration:</b> <code>12.3s</code>
 
-🛠 Tools Invoked:
-• run_command: pwd (PASS)
-• read_file: main.go (PASS)
+<blockquote><b>Executive Summary:</b>
+Server normal dan sehat.
+</blockquote>
 
-Langkah kedua telah selesai.`
+<b>🛠 Tools Invoked:</b>
+• <code>run_command</code>: <code>top -b -n 1</code> (<b>PASS</b>)
 
-	gotTools := cleanAgentResponse(rawToolsOnly)
-	if strings.Contains(gotTools, "🛠 Tools Invoked:") || strings.Contains(gotTools, "run_command: pwd") {
-		t.Errorf("expected tools block to be removed, got: %s", gotTools)
+<i>Session ID:</i> <code>99323ee4</code>`
+
+	gotHTML := cleanAgentResponse(rawHTML)
+	if strings.Contains(gotHTML, "TASK EXECUTION COMPLETED") || strings.Contains(gotHTML, "Tools Invoked") || strings.Contains(gotHTML, "Session ID") {
+		t.Errorf("expected HTML card to be cleaned, got: %s", gotHTML)
 	}
-	if !strings.Contains(gotTools, "Langkah awal berhasil.") || !strings.Contains(gotTools, "Langkah kedua telah selesai.") {
-		t.Errorf("expected surrounding text to be preserved, got: %s", gotTools)
+	if !strings.Contains(gotHTML, "Server normal dan sehat.") {
+		t.Errorf("expected HTML summary text to be preserved, got: %s", gotHTML)
+	}
+
+	rawCode := "Berikut solusi kode:\n```go\npackage main\nfunc main() {}\n```\nSelesai."
+	gotCode := cleanAgentResponse(rawCode)
+	if gotCode != rawCode {
+		t.Errorf("expected code block to be preserved, got: %s", gotCode)
 	}
 }
 
@@ -706,6 +765,24 @@ func TestRouterActiveTaskProtectionAndKill(t *testing.T) {
 		t.Fatalf("expected active task to remain present after busy prompt")
 	}
 
+	upKillPID := tgbotapi.Update{
+		UpdateID: 4015,
+		Message: &tgbotapi.Message{
+			MessageID: 2015,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/kill 999999",
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 5},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, upKillPID)
+
+	if canceled {
+		t.Fatalf("expected /kill <pid> not to cancel active task")
+	}
+
 	upKill := tgbotapi.Update{
 		UpdateID: 402,
 		Message: &tgbotapi.Message{
@@ -780,7 +857,11 @@ func TestRouterAdvancedCommands(t *testing.T) {
 	}
 
 	textTriggers := []string{
+		"new",
+		"new mulai proyek baru",
+		"plan",
 		"plan audit performa vps",
+		"teamwork",
 		"teamwork audit keamanan cluster",
 		"boost learn",
 		"tools",
