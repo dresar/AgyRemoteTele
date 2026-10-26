@@ -30,18 +30,19 @@ import (
 )
 
 type Router struct {
-	api            *tgbotapi.BotAPI
-	authManager    *session.AuthManager
-	sessionStore   *session.Store
-	profileManager *agy.ProfileManager
-	historyReader  *agy.HistoryReader
-	executor       *agy.Executor
-	renderer       *Renderer
-	middleware     *Middleware
-	execTimeout    time.Duration
-	scheduler      *scheduler.Scheduler
-	watchdog       *watchdog.Watchdog
-	swarmManager   *cluster.SwarmManager
+	api             *tgbotapi.BotAPI
+	authManager     *session.AuthManager
+	sessionStore    *session.Store
+	profileManager  *agy.ProfileManager
+	historyReader   *agy.HistoryReader
+	executor        *agy.Executor
+	renderer        *Renderer
+	middleware      *Middleware
+	execTimeout     time.Duration
+	scheduler       *scheduler.Scheduler
+	watchdog        *watchdog.Watchdog
+	swarmManager    *cluster.SwarmManager
+	fastLoginScript string
 }
 
 func NewRouter(
@@ -56,16 +57,28 @@ func NewRouter(
 	execTimeout time.Duration,
 ) *Router {
 	return &Router{
-		api:            api,
-		authManager:    authManager,
-		sessionStore:   sessionStore,
-		profileManager: profileManager,
-		historyReader:  historyReader,
-		executor:       executor,
-		renderer:       renderer,
-		middleware:     middleware,
-		execTimeout:    execTimeout,
+		api:             api,
+		authManager:     authManager,
+		sessionStore:    sessionStore,
+		profileManager:  profileManager,
+		historyReader:   historyReader,
+		executor:        executor,
+		renderer:        renderer,
+		middleware:      middleware,
+		execTimeout:     execTimeout,
+		fastLoginScript: "/opt/data/home/agy-profiles/fast_login.py",
 	}
+}
+
+func (r *Router) SetFastLoginScript(path string) {
+	r.fastLoginScript = path
+}
+
+func (r *Router) getFastLoginScript() string {
+	if r.fastLoginScript != "" {
+		return r.fastLoginScript
+	}
+	return "/opt/data/home/agy-profiles/fast_login.py"
 }
 
 func (r *Router) SetScheduler(s *scheduler.Scheduler) {
@@ -205,11 +218,13 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		r.handleUsage(ctx, chatID)
 	case "accounts":
 		r.handleAccounts(ctx, chatID)
+	case "up", "start_worker", "hidupkan":
+		r.handleUp(ctx, chatID, args)
 	case "refresh":
 		if args != "" {
-			r.handleRefreshAccount(ctx, chatID, args)
+			r.handleUp(ctx, chatID, args)
 		} else {
-			r.handleRefresh(ctx, chatID)
+			r.handleUp(ctx, chatID, "semua")
 		}
 	case "ask":
 		r.handleAsk(ctx, chatID, sess, args)
@@ -237,6 +252,22 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		r.handleGit(ctx, chatID, sess, args)
 	default:
 		if !msg.IsCommand() && text != "" {
+			lowerText := strings.ToLower(text)
+			if strings.HasPrefix(lowerText, "hidupkan") {
+				upArg := strings.TrimSpace(strings.TrimPrefix(text[len("hidupkan"):], ":"))
+				r.handleUp(ctx, chatID, upArg)
+				return
+			}
+			if strings.HasPrefix(lowerText, "start_worker") {
+				upArg := strings.TrimSpace(strings.TrimPrefix(text[len("start_worker"):], ":"))
+				r.handleUp(ctx, chatID, upArg)
+				return
+			}
+			if lowerText == "up" || strings.HasPrefix(lowerText, "up ") {
+				upArg := strings.TrimSpace(strings.TrimPrefix(text[len("up"):], ":"))
+				r.handleUp(ctx, chatID, upArg)
+				return
+			}
 			r.handleAsk(ctx, chatID, sess, text)
 		} else if msg.IsCommand() {
 			r.replyHTML(chatID, fmt.Sprintf("<b>❓ Unknown Command:</b> <code>/%s</code>\nType <code>/help</code> for available commands.", html.EscapeString(cmd)))
@@ -552,6 +583,24 @@ func (r *Router) handleGit(ctx context.Context, chatID int64, sess *session.Sess
 	r.replyHTMLWithBack(chatID, r.renderer.RenderGitSummary(summary))
 }
 
+func wrapPrompt(chatID int64, profile string, workingDir string, prompt string) string {
+	return fmt.Sprintf(`[TELEGRAM AGY REMOTE GATEWAY — AUTONOMOUS OPERATOR DIRECTIVE]
+Pengirim: Telegram Operator (Chat ID: %d)
+Worker Profil: %s
+Working Directory: %s
+
+INSTRUKSI PENGGUNA:
+%s
+
+STANDAR OPERASIONAL CERDAS (FULL AUTONOMOUS & SELF-HEALING):
+1. OTONOMI PENUH: Eksekusi tools, bash command, dan tindakan teknis secara langsung tanpa perlu meminta izin bolak-balik ke operator.
+2. SELF-HEALING & MAINTENANCE: Jika menemukan bug, error sistem, atau kegagalan pada bot remote AgyRemoteTele atau script worker, agy WAJIB langsung mengaudit dan memperbaiki (edit) kode terkait hingga tuntas.
+3. STANDAR NOKOMEN: DILARANG menulis komentar dalam kode yang dibuat atau diedit.
+4. GIT-FIRST: Pastikan setiap perubahan kode yang teruji di-commit dan siap di-push ke GitHub repository.
+5. FORMAT RESPON TELEGRAM: Berikan jawaban akhir yang SINGKAT, PADAT, dan TO-THE-POINT mengenai apa yang telah dikerjakan, status perbaikan, dan hasil verifikasi.`,
+		chatID, profile, workingDir, prompt)
+}
+
 func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Session, prompt string) {
 	cleanPrompt := strings.TrimSpace(prompt)
 	if cleanPrompt == "" {
@@ -582,20 +631,7 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 		}
 	}()
 
-	wrappedPrompt := fmt.Sprintf(`[TELEGRAM AGY REMOTE GATEWAY — OPERATOR REQUEST]
-Pengirim: Telegram Operator (Chat ID: %d)
-Worker Profil: %s
-Working Directory: %s
-
-INSTRUKSI PENGGUNA:
-%s
-
-STANDAR OPERASIONAL (ZERO TOLERANCE):
-1. Pahami instruksi dan eksekusi tindakan yang diperlukan secara presisi.
-2. STANDAR NOKOMEN: Jangan menulis komentar dalam kode yang dibuat/diedit.
-3. QUALITY GATE: Pastikan kode bebas dari error kompilasi/sintaks.
-4. FORMAT RESPON TELEGRAM: Berikan jawaban akhir yang SINGKAT, PADAT, dan TO-THE-POINT mengenai apa yang telah dikerjakan, status perubahan, dan verifikasi. Hindari narasi panjang bertele-tele.`,
-		chatID, sess.ActiveProfile, sess.ActiveWorkingDir, cleanPrompt)
+	wrappedPrompt := wrapPrompt(chatID, sess.ActiveProfile, sess.ActiveWorkingDir, cleanPrompt)
 
 	req := agy.ExecutionRequest{
 		Profile:        sess.ActiveProfile,
@@ -647,19 +683,7 @@ STANDAR OPERASIONAL (ZERO TOLERANCE):
 	r.sessionStore.SetLastBotMessageIDs(chatID, sentIDs)
 }
 
-func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
-	r.sendTyping(chatID)
-
-	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "status")
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Accounts Status Error:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
-		return
-	}
-
+func renderAccountsStatus(out []byte) (string, tgbotapi.InlineKeyboardMarkup) {
 	lines := strings.Split(string(out), "\n")
 	type accInfo struct {
 		name      string
@@ -698,8 +722,13 @@ func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 	}
 
 	if len(accounts) == 0 {
-		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>👥 AGY WORKER ACCOUNTS</b>\n\n<pre><code>%s</code></pre>", html.EscapeString(string(out))))
-		return
+		markup := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("⚡ Hidupkan Semua", "nav:up_all"),
+				tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+			),
+		)
+		return fmt.Sprintf("<b>👥 AGY WORKER ACCOUNTS</b>\n\n<pre><code>%s</code></pre>", html.EscapeString(string(out))), markup
 	}
 
 	activeCount := 0
@@ -714,10 +743,20 @@ func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 
 	for _, acc := range accounts {
 		emoji := "🔴"
+		desc := acc.status
+		lowerStatus := strings.ToLower(acc.status)
+		isStandby := strings.EqualFold(acc.status, "Standby") ||
+			strings.EqualFold(acc.status, "Siap Aktif") ||
+			strings.Contains(lowerStatus, "standby") ||
+			strings.Contains(lowerStatus, "siap aktif")
+
 		if acc.active {
 			emoji = "🟢"
+		} else if isStandby {
+			emoji = "🟡"
+			desc = fmt.Sprintf("%s — Siap Dihidupkan", acc.status)
 		}
-		b.WriteString(fmt.Sprintf("%s <b>%s</b> • <b>%s</b>\n", emoji, html.EscapeString(acc.name), html.EscapeString(acc.status)))
+		b.WriteString(fmt.Sprintf("%s <b>%s</b> • <b>%s</b>\n", emoji, html.EscapeString(acc.name), html.EscapeString(desc)))
 		b.WriteString(fmt.Sprintf("  ├ ⏱ <code>%s</code>\n", html.EscapeString(acc.remaining)))
 		b.WriteString(fmt.Sprintf("  └ 📧 <code>%s</code>\n\n", html.EscapeString(acc.email)))
 	}
@@ -725,7 +764,7 @@ func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 	var rows [][]tgbotapi.InlineKeyboardButton
 	var currentRow []tgbotapi.InlineKeyboardButton
 	for _, acc := range accounts {
-		btn := tgbotapi.NewInlineKeyboardButtonData("🔄 "+acc.name, "refresh_acc:"+acc.name)
+		btn := tgbotapi.NewInlineKeyboardButtonData("⚡ "+acc.name, "up_acc:"+acc.name)
 		currentRow = append(currentRow, btn)
 		if len(currentRow) == 5 {
 			rows = append(rows, currentRow)
@@ -736,16 +775,128 @@ func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 		rows = append(rows, currentRow)
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh Semua", "nav:refresh"),
+		tgbotapi.NewInlineKeyboardButtonData("⚡ Hidupkan Semua", "nav:up_all"),
 		tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
 	))
-	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
 
-	r.replyHTMLWithMarkup(chatID, strings.TrimRight(b.String(), "\n"), markup)
+	return strings.TrimRight(b.String(), "\n"), tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
-func (r *Router) handleRefresh(ctx context.Context, chatID int64) {
+func renderUpSingle(profile, status, email, remaining, detail string, isErr bool) (string, tgbotapi.InlineKeyboardMarkup) {
+	if profile == "" {
+		profile = "Worker"
+	}
+	if status == "" {
+		if isErr {
+			status = "Gagal"
+		} else {
+			status = "Berhasil dihidupkan"
+		}
+	}
+	emoji := "🟢"
+	lowerSt := strings.ToLower(status)
+	if isErr || strings.Contains(lowerSt, "gagal") || strings.Contains(lowerSt, "error") {
+		emoji = "🔴"
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("<b>⚡ WORKER DIAKTIFKAN — %s</b>\n\n", strings.ToUpper(profile)))
+	b.WriteString(fmt.Sprintf("Status: %s <b>%s</b>\n", emoji, html.EscapeString(status)))
+	if remaining != "" && remaining != "-" {
+		b.WriteString(fmt.Sprintf("⏱ <b>Sisa Waktu:</b> <code>%s</code>\n", html.EscapeString(remaining)))
+	}
+	if email != "" && email != "-" && email != "Unknown" {
+		b.WriteString(fmt.Sprintf("📧 <b>Email Aktif:</b> <code>%s</code>\n", html.EscapeString(email)))
+	}
+	if detail != "" {
+		b.WriteString(fmt.Sprintf("⚠️ <b>Detail:</b> <code>%s</code>\n", html.EscapeString(detail)))
+	}
+
+	markup := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Akun Worker", "nav:accounts"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+		),
+	)
+	return strings.TrimRight(b.String(), "\n"), markup
+}
+
+func renderUpAll(outStr string, err error) (string, tgbotapi.InlineKeyboardMarkup) {
+	reAll := regexp.MustCompile(`^\[(agy\d+)\]\s+(.*?)(?:\s*\((.*?)\))?\s*-\s*(.*)$`)
+	var items []string
+	lines := strings.Split(outStr, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[agy") {
+			emoji := "🟢"
+			lowerLine := strings.ToLower(trimmed)
+			if strings.Contains(lowerLine, "gagal") || strings.Contains(lowerLine, "error") {
+				emoji = "🔴"
+			} else if strings.Contains(lowerLine, "dilewati") {
+				emoji = "🟡"
+			}
+
+			m := reAll.FindStringSubmatch(trimmed)
+			if len(m) >= 5 {
+				accName := strings.ToUpper(m[1])
+				statusDesc := m[4]
+				emailVal := m[3]
+				if emailVal != "" && emailVal != "Unknown" {
+					items = append(items, fmt.Sprintf("%s <b>%s</b> • %s\n   └ 📧 <code>%s</code>", emoji, html.EscapeString(accName), html.EscapeString(statusDesc), html.EscapeString(emailVal)))
+				} else {
+					items = append(items, fmt.Sprintf("%s <b>%s</b> • %s", emoji, html.EscapeString(accName), html.EscapeString(statusDesc)))
+				}
+			} else {
+				items = append(items, fmt.Sprintf("%s <code>%s</code>", emoji, html.EscapeString(trimmed)))
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("<b>⚡ SEMUA WORKER DIAKTIFKAN (AGY01 - AGY10)</b>\n\n")
+	if len(items) > 0 {
+		b.WriteString(strings.Join(items, "\n"))
+	} else if len(outStr) > 0 {
+		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(outStr)))
+	} else {
+		b.WriteString("<i>Semua token worker berhasil diproses.</i>")
+	}
+
+	if err != nil && len(items) == 0 {
+		b.WriteString(fmt.Sprintf("\n\n<b>Notice:</b> <code>%s</code>", html.EscapeString(err.Error())))
+	}
+
+	markup := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Akun Worker", "nav:accounts"),
+			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+		),
+	)
+	return strings.TrimRight(b.String(), "\n"), markup
+}
+
+func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 	r.sendTyping(chatID)
+
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", r.getFastLoginScript(), "status")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Accounts Status Error:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	text, markup := renderAccountsStatus(out)
+	r.replyHTMLWithMarkup(chatID, text, markup)
+}
+
+func (r *Router) handleUp(ctx context.Context, chatID int64, account string) {
+	r.sendTyping(chatID)
+
+	cleanArg := strings.ToLower(strings.TrimSpace(account))
+	isAll := cleanArg == "" || cleanArg == "semua" || cleanArg == "all"
 
 	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -764,46 +915,65 @@ func (r *Router) handleRefresh(ctx context.Context, chatID int64) {
 		}
 	}()
 
-	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "refresh")
+	scriptPath := r.getFastLoginScript()
+	var cmd *exec.Cmd
+	var targetAcc string
+	if isAll {
+		cmd = exec.CommandContext(execCtx, "python3", scriptPath, "refresh")
+	} else {
+		targetAcc = normalizeAccount(cleanArg)
+		cmd = exec.CommandContext(execCtx, "python3", scriptPath, "refresh", targetAcc)
+	}
+
 	out, err := cmd.CombinedOutput()
 	close(typingDone)
 
 	if err != nil && len(out) == 0 {
-		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Refresh Execution Failed:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		label := "Semua Worker"
+		if !isAll {
+			label = targetAcc
+		}
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Gagal Menghidupkan Worker (%s):</b>\n<pre><code>%s</code></pre>", html.EscapeString(label), html.EscapeString(err.Error())))
 		return
 	}
 
-	lines := strings.Split(string(out), "\n")
-	var items []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[agy") {
-			emoji := "🟢"
-			if strings.Contains(trimmed, "Gagal") || strings.Contains(trimmed, "Error") {
-				emoji = "🔴"
-			} else if strings.Contains(trimmed, "Dilewati") {
-				emoji = "⚪"
+	outStr := strings.TrimSpace(string(out))
+
+	if !isAll {
+		var prof, st, em, remaining, detail string
+		for _, line := range strings.Split(outStr, "\n") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				k := strings.ToLower(strings.TrimSpace(parts[0]))
+				v := strings.TrimSpace(parts[1])
+				switch k {
+				case "profil":
+					prof = v
+				case "status":
+					st = v
+				case "email":
+					em = v
+				case "sisa waktu":
+					remaining = v
+				case "detail":
+					detail = v
+				}
 			}
-			items = append(items, fmt.Sprintf("%s <code>%s</code>", emoji, html.EscapeString(trimmed)))
 		}
+		if prof == "" {
+			prof = targetAcc
+		}
+		text, markup := renderUpSingle(prof, st, em, remaining, detail, err != nil && strings.Contains(strings.ToLower(outStr), "error"))
+		r.replyHTMLWithMarkup(chatID, text, markup)
+		return
 	}
 
-	var b strings.Builder
-	b.WriteString("<b>🔄 AGY WORKER TOKENS REFRESH</b>\n\n")
+	text, markup := renderUpAll(outStr, err)
+	r.replyHTMLWithMarkup(chatID, text, markup)
+}
 
-	if len(items) > 0 {
-		b.WriteString(strings.Join(items, "\n"))
-	} else if len(out) > 0 {
-		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(string(out))))
-	} else {
-		b.WriteString("<i>Command completed with no output.</i>")
-	}
-
-	if err != nil {
-		b.WriteString(fmt.Sprintf("\n\n<b>Notice:</b> <code>%s</code>", html.EscapeString(err.Error())))
-	}
-
-	r.replyHTMLWithBack(chatID, b.String())
+func (r *Router) handleRefresh(ctx context.Context, chatID int64) {
+	r.handleUp(ctx, chatID, "semua")
 }
 
 func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQuery) {
@@ -862,9 +1032,15 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 		return
 	}
 
+	if strings.HasPrefix(data, "up_acc:") {
+		target := strings.TrimPrefix(data, "up_acc:")
+		r.handleUp(ctx, chatID, target)
+		return
+	}
+
 	if strings.HasPrefix(data, "refresh_acc:") {
 		target := strings.TrimPrefix(data, "refresh_acc:")
-		r.handleRefreshAccount(ctx, chatID, target)
+		r.handleUp(ctx, chatID, target)
 		return
 	}
 
@@ -1026,8 +1202,8 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 	case "nav:accounts":
 		r.handleAccounts(ctx, chatID)
 
-	case "nav:refresh":
-		r.handleRefresh(ctx, chatID)
+	case "nav:up_all", "nav:refresh":
+		r.handleUp(ctx, chatID, "semua")
 
 	case "nav:workers":
 		r.handleWorkers(ctx, chatID)
@@ -1295,25 +1471,7 @@ func (r *Router) handleSwitch(chatID int64, sess *session.Session, targetProfile
 }
 
 func (r *Router) handleRefreshAccount(ctx context.Context, chatID int64, account string) {
-	r.sendTyping(chatID)
-
-	cleanAcc := normalizeAccount(account)
-	execCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "refresh", cleanAcc)
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Refresh Error (%s):</b>\n<pre><code>%s</code></pre>", html.EscapeString(cleanAcc), html.EscapeString(err.Error())))
-		return
-	}
-
-	outStr := strings.TrimSpace(string(out))
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("<b>🔄 TOKEN REFRESH — %s</b>\n\n", strings.ToUpper(cleanAcc)))
-	b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(outStr)))
-
-	r.replyHTMLWithBack(chatID, b.String())
+	r.handleUp(ctx, chatID, account)
 }
 
 func (r *Router) handleSend(ctx context.Context, chatID int64, args string) {
@@ -1559,6 +1717,8 @@ func (r *Router) handleWorkers(ctx context.Context, chatID int64) {
 			badge := "⚪"
 			if strings.Contains(w.daemon, "PID") {
 				badge = "🟢"
+			} else if strings.Contains(strings.ToLower(w.auth), "standby") || strings.Contains(strings.ToLower(w.auth), "siap aktif") {
+				badge = "🟡"
 			}
 			b.WriteString(fmt.Sprintf("%s <b>%s</b> • <code>%s</code>\n", badge, html.EscapeString(w.profile), html.EscapeString(w.remoteID)))
 			b.WriteString(fmt.Sprintf("  ├ 🔐 Auth: %s\n", html.EscapeString(w.auth)))
@@ -1567,7 +1727,16 @@ func (r *Router) handleWorkers(ctx context.Context, chatID int64) {
 		}
 	}
 
-	r.replyHTMLWithBack(chatID, strings.TrimRight(b.String(), "\n"))
+	markup := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚡ Hidupkan Semua", "nav:up_all"),
+			tgbotapi.NewInlineKeyboardButtonData("👥 Akun Worker", "nav:accounts"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+		),
+	)
+	r.replyHTMLWithMarkup(chatID, strings.TrimRight(b.String(), "\n"), markup)
 }
 
 func (r *Router) handleUsage(ctx context.Context, chatID int64) {

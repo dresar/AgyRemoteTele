@@ -152,7 +152,8 @@ func (r *Renderer) RenderHelp() string {
 	b.WriteString("• <code>/tasks</code> — View active & completed worker tasks\n")
 	b.WriteString("• <code>/usage</code> — Cluster token usage & task completion\n")
 	b.WriteString("• <code>/send &lt;account&gt; &lt;prompt&gt;</code> — Dispatch task to specific worker\n")
-	b.WriteString("• <code>/accounts</code> & <code>/refresh</code> — Worker account management\n\n")
+	b.WriteString("• <code>/accounts</code> & <code>/refresh</code> — Worker account management\n")
+	b.WriteString("• <code>/up &lt;acc|semua&gt;</code>, <code>/hidupkan &lt;acc|semua&gt;</code> — Hidupkan worker / refresh token\n\n")
 
 	b.WriteString("<b>📦 Backup & Archival:</b>\n")
 	b.WriteString("• <code>/backup [dir]</code> — Create tar.gz archive (sends doc if &lt; 50MB)\n\n")
