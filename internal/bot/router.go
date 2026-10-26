@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,13 @@ import (
 	"github.com/dresar/AgyRemoteTele/internal/workspace"
 )
 
+type ActiveTask struct {
+	Cancel    context.CancelFunc
+	Profile   string
+	Prompt    string
+	StartedAt time.Time
+}
+
 type Router struct {
 	api             *tgbotapi.BotAPI
 	authManager     *session.AuthManager
@@ -42,6 +50,8 @@ type Router struct {
 	watchdog        *watchdog.Watchdog
 	swarmManager    *cluster.SwarmManager
 	fastLoginScript string
+	activeTasks     map[int64]*ActiveTask
+	activeTasksMu   sync.Mutex
 }
 
 func NewRouter(
@@ -66,6 +76,7 @@ func NewRouter(
 		middleware:      middleware,
 		execTimeout:     execTimeout,
 		fastLoginScript: "/opt/data/home/agy-profiles/fast_login.py",
+		activeTasks:     make(map[int64]*ActiveTask),
 	}
 }
 
@@ -167,7 +178,7 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 	case "ps", "procs":
 		r.handleProcesses(chatID, sess, args)
 	case "kill":
-		r.handleKill(chatID, args)
+		r.handleKillCommand(chatID, args)
 	case "ports", "netstat":
 		r.handlePorts(chatID)
 	case "service":
@@ -227,6 +238,16 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		}
 	case "ask":
 		r.handleAsk(ctx, chatID, sess, args)
+	case "plan":
+		r.handlePlan(ctx, chatID, sess, args)
+	case "boost", "learn":
+		r.handleBoost(ctx, chatID, sess, args)
+	case "teamwork":
+		r.handleTeamwork(ctx, chatID, sess, args)
+	case "tools", "checktools":
+		r.handleTools(chatID)
+	case "continue", "lanjut", "lanjutkan":
+		r.handleContinue(ctx, chatID, sess, args)
 	case "profile":
 		r.handleProfile(chatID, sess, args)
 	case "history":
@@ -234,7 +255,7 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 	case "resume":
 		r.handleResume(chatID, sess, args)
 	case "new":
-		r.handleNew(chatID, sess)
+		r.handleNew(ctx, chatID, sess, args)
 	case "status":
 		r.handleStatus(chatID, sess)
 	case "ls":
@@ -265,6 +286,33 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 			if lowerText == "up" || strings.HasPrefix(lowerText, "up ") {
 				upArg := strings.TrimSpace(strings.TrimPrefix(text[len("up"):], ":"))
 				r.handleUp(ctx, chatID, upArg)
+				return
+			}
+			if strings.HasPrefix(lowerText, "boost") || strings.HasPrefix(lowerText, "learn") {
+				boostArg := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "boost"), "learn"))
+				r.handleBoost(ctx, chatID, sess, boostArg)
+				return
+			}
+			if strings.HasPrefix(lowerText, "plan ") {
+				planArg := strings.TrimSpace(text[len("plan "):])
+				r.handlePlan(ctx, chatID, sess, planArg)
+				return
+			}
+			if strings.HasPrefix(lowerText, "teamwork ") {
+				twArg := strings.TrimSpace(text[len("teamwork "):])
+				r.handleTeamwork(ctx, chatID, sess, twArg)
+				return
+			}
+			if lowerText == "kill" || lowerText == "/kill" || lowerText == "stop" || lowerText == "cancel" {
+				r.handleKillCommand(chatID, "")
+				return
+			}
+			if lowerText == "lanjut" || lowerText == "lanjutkan" || lowerText == "continue" {
+				r.handleContinue(ctx, chatID, sess, "")
+				return
+			}
+			if lowerText == "tools" || lowerText == "checktools" {
+				r.handleTools(chatID)
 				return
 			}
 			r.handleAsk(ctx, chatID, sess, text)
@@ -409,9 +457,106 @@ func (r *Router) handleResume(chatID int64, sess *session.Session, convID string
 		html.EscapeString(cleanID), html.EscapeString(sess.ActiveProfile)))
 }
 
-func (r *Router) handleNew(chatID int64, sess *session.Session) {
+func (r *Router) handleNew(ctx context.Context, chatID int64, sess *session.Session, args string) {
 	r.sessionStore.ClearConversation(chatID)
-	r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>✨ NEW SESSION INITIALIZED</b>\n\nCleared active conversation context on <code>%s</code>. Next instruction will start fresh.", html.EscapeString(sess.ActiveProfile)))
+	cleanArgs := strings.TrimSpace(args)
+	if cleanArgs != "" {
+		r.handleAsk(ctx, chatID, sess, cleanArgs)
+		return
+	}
+	r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>✨ PERCAKAPAN BARU DIMULAI</b>\n\nKonteks percakapan pada worker <code>%s</code> telah di-reset.\nSilakan kirim pesan atau gunakan <code>/ask</code> untuk memulai percakapan baru.", html.EscapeString(sess.ActiveProfile)))
+}
+
+func (r *Router) handleContinue(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	if sess.ActiveConversationID == "" {
+		r.replyHTMLWithBack(chatID, "<b>ℹ️ Belum Ada Percakapan Aktif</b>\n\nTidak ada percakapan aktif yang dapat dilanjutkan.\nKetik <code>/ask &lt;pesan&gt;</code> untuk memulai percakapan baru.")
+		return
+	}
+	prompt := strings.TrimSpace(args)
+	if prompt == "" {
+		prompt = "Lanjutkan tugas dan instruksi sebelumnya."
+	}
+	r.handleAsk(ctx, chatID, sess, prompt)
+}
+
+func (r *Router) handleBoost(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	topic := strings.TrimSpace(args)
+	if topic == "" || strings.EqualFold(topic, "learn") {
+		topic = "sistem, codebase AgyRemoteTele, rules NOKOMEN, skills Antigravity, dan arsitektur cluster"
+	}
+	prompt := fmt.Sprintf(`[DIRECTIVE: AUTONOMOUS LEARNING & SYSTEM CONTEXT BOOST]
+Pelajari dan optimalkan pemahaman kontekstual mengenai: %s.
+Audit lingkungan kerja, struktur repositori, aturan operasional, serta tools dan skills yang tersedia.
+Pastikan kamu siap mengeksekusi tugas-tugas berikutnya dengan presisi tinggi dan antideteksi otonom.
+Berikan ringkasan singkat hasil pemahaman dan kesiapan operasional sistem.`, topic)
+	r.handleAsk(ctx, chatID, sess, prompt)
+}
+
+func (r *Router) handlePlan(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	cleanArgs := strings.TrimSpace(args)
+	if cleanArgs == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/plan &lt;instruksi/tugas&gt;</code>\nContoh: <code>/plan migrasi database postgresql dan caching redis</code>")
+		return
+	}
+	prompt := fmt.Sprintf(`[DIRECTIVE: AUTONOMOUS ARCHITECTURE & EXECUTION PLANNING]
+Buatkan rencana eksekusi (execution plan) yang komprehensif, terstruktur, dan mendalam untuk tugas berikut SEBELUM dilakukan tindakan eksekusi teknis:
+
+%s
+
+FORMAT RENCANA WAJIB:
+1. Target & Analisis Kebutuhan
+2. Dampak Arsitektur, Modul & Batasan File
+3. Langkah Eksekusi Bertahap (Step-by-Step Implementation Roadmap)
+4. Analisis Risiko & Strategi Mitigasi
+5. Rencana Pengujian & Validasi Kualitas
+
+PENTING: JANGAN melakukan perubahan file/mutasi kode pada tahap ini. Sajikan rencana lengkap dan terstruktur agar operator Telegram dapat meninjau dan menyetujuinya terlebih dahulu.`, cleanArgs)
+	r.handleAsk(ctx, chatID, sess, prompt)
+}
+
+func (r *Router) handleTeamwork(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	cleanArgs := strings.TrimSpace(args)
+	if cleanArgs == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/teamwork &lt;tugas kolaboratif&gt;</code>\nContoh: <code>/teamwork audit keamanan cluster dan perbaikan performa</code>")
+		return
+	}
+	prompt := fmt.Sprintf(`[DIRECTIVE: MULTI-WORKER CLUSTER COLLABORATION & TEAMWORK]
+Koordinasikan dan rancang pembagian kerja tim multi-worker Antigravity (agy01 - agy10) untuk menyelesaikan tugas berikut secara terintegrasi:
+
+%s
+
+PEMBAGIAN PERAN KLASTER:
+• agy01 - agy02: Perencanaan Strategis, Arsitektur Sistem & Orkestrasi
+• agy03 - agy08: Eksekusi Implementasi Fitur, Backend, dan Worker Tools
+• agy09: Pengujian Komprehensif (Unit Testing, Integration Testing, Edge Cases)
+• agy10: Code Review Independen, Standar NOKOMEN, dan Recovery Specialist
+
+Sajikan koordinasi kerja tim, alokasi tugas masing-masing worker, serta alur kolaborasi untuk menyelesaikan misi ini.`, cleanArgs)
+	r.handleAsk(ctx, chatID, sess, prompt)
+}
+
+func (r *Router) handleTools(chatID int64) {
+	r.replyHTMLWithBack(chatID, r.renderer.RenderTools())
+}
+
+func (r *Router) handleKillCommand(chatID int64, args string) {
+	r.activeTasksMu.Lock()
+	activeTask, exists := r.activeTasks[chatID]
+	if exists {
+		delete(r.activeTasks, chatID)
+		r.activeTasksMu.Unlock()
+		activeTask.Cancel()
+		r.replyHTML(chatID, fmt.Sprintf("🛑 <b>PROSES DIHENTIKAN</b>\n\nProses Antigravity pada profil <code>%s</code> berhasil dihentikan (/kill).", html.EscapeString(activeTask.Profile)))
+		return
+	}
+	r.activeTasksMu.Unlock()
+
+	if strings.TrimSpace(args) != "" {
+		r.handleKill(chatID, args)
+		return
+	}
+
+	r.replyHTML(chatID, "ℹ️ <i>Tidak ada tugas Antigravity yang sedang berjalan pada sesi ini.</i>\n\nUntuk menghentikan proses sistem VPS tertentu, gunakan: <code>/kill &lt;pid&gt; [signal]</code>")
 }
 
 func (r *Router) handleStatus(chatID int64, sess *session.Session) {
@@ -582,6 +727,70 @@ func (r *Router) handleGit(ctx context.Context, chatID int64, sess *session.Sess
 	r.replyHTMLWithBack(chatID, r.renderer.RenderGitSummary(summary))
 }
 
+func cleanAgentResponse(resp string) string {
+	trimmed := strings.TrimSpace(resp)
+	if trimmed == "" {
+		return ""
+	}
+
+	if strings.Contains(trimmed, "⚡ TASK EXECUTION COMPLETED") {
+		idx := strings.Index(trimmed, "⚡ TASK EXECUTION COMPLETED")
+		before := strings.TrimSpace(trimmed[:idx])
+		after := trimmed[idx:]
+		lines := strings.Split(after, "\n")
+		var rest []string
+		skip := true
+		for _, line := range lines {
+			trimmedLine := strings.TrimSpace(line)
+			if skip {
+				if strings.HasPrefix(trimmedLine, "⚡ TASK EXECUTION COMPLETED") ||
+					strings.HasPrefix(trimmedLine, "Profile:") ||
+					strings.HasPrefix(trimmedLine, "Duration:") ||
+					strings.HasPrefix(trimmedLine, "Executive Summary:") ||
+					strings.HasPrefix(trimmedLine, "🛠 Tools Invoked:") ||
+					strings.HasPrefix(trimmedLine, "• ") ||
+					strings.HasPrefix(trimmedLine, "- ") ||
+					strings.HasPrefix(trimmedLine, "Session ID:") ||
+					strings.HasPrefix(trimmedLine, "📁 File Changes:") ||
+					trimmedLine == "" {
+					continue
+				}
+				skip = false
+			}
+			rest = append(rest, line)
+		}
+		candidate := strings.TrimSpace(strings.Join(rest, "\n"))
+		if candidate != "" {
+			trimmed = candidate
+		} else if before != "" {
+			trimmed = before
+		}
+	}
+
+	if strings.Contains(trimmed, "🛠 Tools Invoked:") {
+		lines := strings.Split(trimmed, "\n")
+		var cleanLines []string
+		inTools := false
+		for _, line := range lines {
+			if strings.Contains(line, "🛠 Tools Invoked:") {
+				inTools = true
+				continue
+			}
+			if inTools {
+				trimmedLine := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmedLine, "•") || strings.HasPrefix(trimmedLine, "-") || trimmedLine == "" {
+					continue
+				}
+				inTools = false
+			}
+			cleanLines = append(cleanLines, line)
+		}
+		trimmed = strings.TrimSpace(strings.Join(cleanLines, "\n"))
+	}
+
+	return trimmed
+}
+
 func wrapPrompt(chatID int64, profile string, workingDir string, prompt string) string {
 	return fmt.Sprintf(`[TELEGRAM AGY REMOTE GATEWAY — AUTONOMOUS OPERATOR DIRECTIVE]
 Pengirim: Telegram Operator (Chat ID: %d)
@@ -592,11 +801,11 @@ INSTRUKSI PENGGUNA:
 %s
 
 STANDAR OPERASIONAL CERDAS (FULL AUTONOMOUS & SELF-HEALING):
-1. OTONOMI PENUH: Eksekusi tools, bash command, dan tindakan teknis secara langsung tanpa perlu meminta izin bolak-balik ke operator.
-2. SELF-HEALING & MAINTENANCE: Jika menemukan bug, error sistem, atau kegagalan pada bot remote AgyRemoteTele atau script worker, agy WAJIB langsung mengaudit dan memperbaiki (edit) kode terkait hingga tuntas.
+1. OTONOMI PENUH: Eksekusi tools, bash command, dan tindakan teknis secara langsung tanpa perlu meminta izin bolak-balik ke operator. Bekerja secara stealth dan antideteksi.
+2. SELF-HEALING & MAINTENANCE: Jika menemukan bug, error sistem, atau kegagalan pada bot remote AgyRemoteTele atau script worker, agy WAJIB langsung mengaudit dan memperbaiki (edit) kode terkait hingga tuntas. Otomatis paham dan wajib menggunakan seluruh native tools Antigravity.
 3. STANDAR NOKOMEN: DILARANG menulis komentar dalam kode yang dibuat atau diedit.
 4. GIT-FIRST: Pastikan setiap perubahan kode yang teruji di-commit dan siap di-push ke GitHub repository.
-5. FORMAT RESPON TELEGRAM: Berikan jawaban akhir yang SINGKAT, PADAT, dan TO-THE-POINT mengenai apa yang telah dikerjakan, status perbaikan, dan hasil verifikasi.`,
+5. FORMAT RESPON TELEGRAM: Berikan jawaban akhir yang SINGKAT, PADAT, dan TO-THE-POINT mengenai apa yang telah dikerjakan, status perbaikan, dan hasil verifikasi. DILARANG KERAS menampilkan log eksekusi tools CLI, daftar 'Tools Invoked', teks 'TASK EXECUTION COMPLETED', atau output mentah command line pada respons akhir. HANYA tampilkan hasil akhir bersih.`,
 		chatID, profile, workingDir, prompt)
 }
 
@@ -607,18 +816,55 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 		return
 	}
 
+	r.activeTasksMu.Lock()
+	if active, exists := r.activeTasks[chatID]; exists {
+		elapsed := time.Since(active.StartedAt).Round(time.Second)
+		r.activeTasksMu.Unlock()
+		r.replyHTML(chatID, fmt.Sprintf(
+			"⚠️ <b>Sesi Masih Berjalan Memproses!</b>\n\n"+
+				"<b>Worker:</b> <code>%s</code>\n"+
+				"<b>Tugas:</b> <code>%s</code>\n"+
+				"<b>Durasi:</b> <code>%s</code>\n\n"+
+				"⏳ <i>Antigravity sedang bekerja (sedang memproses)...</i>\n"+
+				"Silakan tunggu hingga selesai, atau ketik <code>/kill</code> untuk menghentikan proses Antigravity yang sedang berjalan.",
+			html.EscapeString(active.Profile),
+			html.EscapeString(truncateString(active.Prompt, 60)),
+			elapsed,
+		))
+		return
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, r.execTimeout)
+	r.activeTasks[chatID] = &ActiveTask{
+		Cancel:    cancel,
+		Profile:   sess.ActiveProfile,
+		Prompt:    cleanPrompt,
+		StartedAt: time.Now(),
+	}
+	r.activeTasksMu.Unlock()
+
+	defer func() {
+		cancel()
+		r.activeTasksMu.Lock()
+		delete(r.activeTasks, chatID)
+		r.activeTasksMu.Unlock()
+	}()
+
 	placeholderText := fmt.Sprintf("⏳ <b>Processing task on [%s]...</b>\n<i>Prompt:</i> <code>%s</code>",
 		html.EscapeString(sess.ActiveProfile), html.EscapeString(truncateString(cleanPrompt, 60)))
 	initMsg := tgbotapi.NewMessage(chatID, placeholderText)
 	initMsg.ParseMode = tgbotapi.ModeHTML
-	sentMsg, err := r.api.Send(initMsg)
+	var sentMsg tgbotapi.Message
+	var err error
+	if r.api != nil {
+		sentMsg, err = r.api.Send(initMsg)
+	}
 
-	execCtx, cancel := context.WithTimeout(ctx, r.execTimeout)
-	defer cancel()
+	r.sendTyping(chatID)
 
 	typingDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(4 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -642,13 +888,18 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 	result, execErr := r.executor.Execute(execCtx, req)
 	close(typingDone)
 
-	if result != nil && result.ConversationID != "" {
-		r.sessionStore.SetConversation(chatID, result.ConversationID)
-	}
-
-	if err == nil {
+	if err == nil && r.api != nil && sentMsg.MessageID != 0 {
 		del := tgbotapi.NewDeleteMessage(chatID, sentMsg.MessageID)
 		_, _ = r.api.Request(del)
+	}
+
+	if execCtx.Err() == context.Canceled {
+		r.replyHTML(chatID, fmt.Sprintf("🛑 <b>PROSES DIHENTIKAN</b>\n\nTugas Antigravity pada profil <code>%s</code> telah dihentikan atas permintaan pengguna (/kill).", html.EscapeString(sess.ActiveProfile)))
+		return
+	}
+
+	if result != nil && result.ConversationID != "" {
+		r.sessionStore.SetConversation(chatID, result.ConversationID)
 	}
 
 	if execErr != nil && (result == nil || result.Response == "") {
@@ -660,27 +911,29 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 
 	responseText := ""
 	if result != nil {
-		responseText = strings.TrimSpace(result.Response)
+		responseText = cleanAgentResponse(result.Response)
 	}
 	if responseText == "" {
 		responseText = "Execution finished with no text output."
 	}
 
-	chunks := r.renderer.ChunkMessage(html.EscapeString(responseText), 4000)
-	for _, chunk := range chunks {
-		msg := tgbotapi.NewMessage(chatID, chunk)
-		msg.ParseMode = tgbotapi.ModeHTML
-		if sent, err := r.api.Send(msg); err == nil {
-			sentIDs = append(sentIDs, sent.MessageID)
-		} else {
-			rawChunks := r.renderer.ChunkMessage(responseText, 4000)
-			for _, rawChunk := range rawChunks {
-				rawMsg := tgbotapi.NewMessage(chatID, rawChunk)
-				if fallbackSent, fallbackErr := r.api.Send(rawMsg); fallbackErr == nil {
-					sentIDs = append(sentIDs, fallbackSent.MessageID)
+	if r.api != nil {
+		chunks := r.renderer.ChunkMessage(html.EscapeString(responseText), 4000)
+		for _, chunk := range chunks {
+			msg := tgbotapi.NewMessage(chatID, chunk)
+			msg.ParseMode = tgbotapi.ModeHTML
+			if sent, err := r.api.Send(msg); err == nil {
+				sentIDs = append(sentIDs, sent.MessageID)
+			} else {
+				rawChunks := r.renderer.ChunkMessage(responseText, 4000)
+				for _, rawChunk := range rawChunks {
+					rawMsg := tgbotapi.NewMessage(chatID, rawChunk)
+					if fallbackSent, fallbackErr := r.api.Send(rawMsg); fallbackErr == nil {
+						sentIDs = append(sentIDs, fallbackSent.MessageID)
+					}
 				}
+				break
 			}
-			break
 		}
 	}
 
@@ -1259,6 +1512,11 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 	case "nav:git":
 		summary, _ := workspace.InspectRepository(sess.ActiveWorkingDir)
 		text := r.renderer.RenderGitSummary(summary)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:tools":
+		text := r.renderer.RenderTools()
 		markup := r.getBackMarkup()
 		r.editMessage(chatID, msgID, text, &markup)
 

@@ -544,3 +544,274 @@ func TestRouterUpCommandHandling(t *testing.T) {
 		router.HandleUpdate(ctx, up)
 	}
 }
+
+func TestCleanAgentResponse(t *testing.T) {
+	rawNormal := "Halo, ini respon bersih dari agent."
+	if got := cleanAgentResponse(rawNormal); got != rawNormal {
+		t.Errorf("cleanAgentResponse(%q) = %q, expected unchanged", rawNormal, got)
+	}
+
+	rawLeaked := `⚡ TASK EXECUTION COMPLETED
+Profile: agy10 | Duration: 206.2s
+
+Executive Summary:
+Hasil pengecekan riwayat chat untuk Telegram Operator (Chat ID: 8638950192):
+
+🛠 Tools Invoked:
+• run_command: ls -la /opt/data/home/AgyRemoteTele/data (PASS)
+• read_file: /opt/data/home/AgyRemoteTele/data/sessions.json
+• run_command: ls -la /opt/data/home/agy-profiles/agy10/.gemini/antigravity-cli/brain/ (PASS)
+
+Session ID: 99323ee4-56fa-4204-b709-801578eff3d1
+
+Jawaban akhir yang sesungguhnya sudah siap.`
+
+	got := cleanAgentResponse(rawLeaked)
+	if strings.Contains(got, "⚡ TASK EXECUTION COMPLETED") {
+		t.Errorf("expected header to be stripped, got: %s", got)
+	}
+	if strings.Contains(got, "🛠 Tools Invoked:") {
+		t.Errorf("expected tools invoked block to be stripped, got: %s", got)
+	}
+	if !strings.Contains(got, "Jawaban akhir yang sesungguhnya sudah siap.") {
+		t.Errorf("expected clean final response to be preserved, got: %s", got)
+	}
+
+	rawToolsOnly := `Langkah awal berhasil.
+
+🛠 Tools Invoked:
+• run_command: pwd (PASS)
+• read_file: main.go (PASS)
+
+Langkah kedua telah selesai.`
+
+	gotTools := cleanAgentResponse(rawToolsOnly)
+	if strings.Contains(gotTools, "🛠 Tools Invoked:") || strings.Contains(gotTools, "run_command: pwd") {
+		t.Errorf("expected tools block to be removed, got: %s", gotTools)
+	}
+	if !strings.Contains(gotTools, "Langkah awal berhasil.") || !strings.Contains(gotTools, "Langkah kedua telah selesai.") {
+		t.Errorf("expected surrounding text to be preserved, got: %s", gotTools)
+	}
+}
+
+func TestRendererTools(t *testing.T) {
+	renderer := NewRenderer()
+	toolsText := renderer.RenderTools()
+
+	expectedSubstrings := []string{
+		"ANTIGRAVITY TOOLS & AUTONOMOUS ENGINE",
+		"run_command",
+		"read_file",
+		"write_to_file",
+		"find_by_name",
+		"grep_search",
+		"list_dir",
+		"manage_task",
+		"--dangerously-skip-permissions",
+		"Autonomous Operator Directive",
+		"Clean Output Stream",
+		"agy-code-review",
+		"agy-operating-protocol",
+	}
+
+	for _, sub := range expectedSubstrings {
+		if !strings.Contains(toolsText, sub) {
+			t.Errorf("RenderTools() missing %q in output:\n%s", sub, toolsText)
+		}
+	}
+}
+
+func TestRouterNewAndContinueCommands(t *testing.T) {
+	router, store, _, _, _ := createTestRouter(t)
+	ctx := context.Background()
+
+	sess := store.GetOrCreate(1001, "admin")
+	sess.IsAuthenticated = true
+	sess.ActiveConversationID = "conv-12345"
+
+	upNew := tgbotapi.Update{
+		UpdateID: 301,
+		Message: &tgbotapi.Message{
+			MessageID: 101,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/new",
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 4},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, upNew)
+
+	updatedSess, _ := store.Get(1001)
+	if updatedSess.ActiveConversationID != "" {
+		t.Errorf("expected /new to clear active conversation ID, got: %s", updatedSess.ActiveConversationID)
+	}
+
+	upContinueEmpty := tgbotapi.Update{
+		UpdateID: 302,
+		Message: &tgbotapi.Message{
+			MessageID: 102,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/continue",
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 9},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, upContinueEmpty)
+}
+
+func TestRouterActiveTaskProtectionAndKill(t *testing.T) {
+	router, store, _, _, _ := createTestRouter(t)
+	ctx := context.Background()
+
+	sess := store.GetOrCreate(1001, "admin")
+	sess.IsAuthenticated = true
+
+	canceled := false
+	_, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	wrappedCancel := func() {
+		canceled = true
+		cancel()
+	}
+
+	router.activeTasksMu.Lock()
+	router.activeTasks[1001] = &ActiveTask{
+		Cancel:    wrappedCancel,
+		Profile:   "agy10",
+		Prompt:    "sedang memproses tugas berat",
+		StartedAt: time.Now().Add(-10 * time.Second),
+	}
+	router.activeTasksMu.Unlock()
+
+	upWhileRunning := tgbotapi.Update{
+		UpdateID: 401,
+		Message: &tgbotapi.Message{
+			MessageID: 201,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "Tolong periksa status",
+		},
+	}
+	router.HandleUpdate(ctx, upWhileRunning)
+
+	router.activeTasksMu.Lock()
+	_, stillExists := router.activeTasks[1001]
+	router.activeTasksMu.Unlock()
+	if !stillExists {
+		t.Fatalf("expected active task to remain present after busy prompt")
+	}
+
+	upKill := tgbotapi.Update{
+		UpdateID: 402,
+		Message: &tgbotapi.Message{
+			MessageID: 202,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/kill",
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 5},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, upKill)
+
+	if !canceled {
+		t.Errorf("expected active task cancel function to be called on /kill")
+	}
+
+	router.activeTasksMu.Lock()
+	_, existsAfterKill := router.activeTasks[1001]
+	router.activeTasksMu.Unlock()
+	if existsAfterKill {
+		t.Errorf("expected active task to be removed after /kill")
+	}
+
+	upKillEmpty := tgbotapi.Update{
+		UpdateID: 403,
+		Message: &tgbotapi.Message{
+			MessageID: 203,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/kill",
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 5},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, upKillEmpty)
+}
+
+func TestRouterAdvancedCommands(t *testing.T) {
+	router, store, _, _, _ := createTestRouter(t)
+	ctx := context.Background()
+
+	sess := store.GetOrCreate(1001, "admin")
+	sess.IsAuthenticated = true
+
+	commands := []string{
+		"/plan buatkan arsitektur microservices",
+		"/boost learn",
+		"/teamwork koordinasi refactor cluster",
+		"/tools",
+		"/lanjut",
+		"/new kerjakan tugas pertama",
+	}
+
+	for i, cmdStr := range commands {
+		cmdWord := strings.Fields(cmdStr)[0]
+		up := tgbotapi.Update{
+			UpdateID: 500 + i,
+			Message: &tgbotapi.Message{
+				MessageID: 300 + i,
+				Chat:      &tgbotapi.Chat{ID: 1001},
+				From:      &tgbotapi.User{UserName: "admin"},
+				Text:      cmdStr,
+				Entities: []tgbotapi.MessageEntity{
+					{Type: "bot_command", Offset: 0, Length: len(cmdWord)},
+				},
+			},
+		}
+		router.HandleUpdate(ctx, up)
+	}
+
+	textTriggers := []string{
+		"plan audit performa vps",
+		"teamwork audit keamanan cluster",
+		"boost learn",
+		"tools",
+		"lanjut",
+		"kill",
+	}
+
+	for i, txt := range textTriggers {
+		up := tgbotapi.Update{
+			UpdateID: 600 + i,
+			Message: &tgbotapi.Message{
+				MessageID: 400 + i,
+				Chat:      &tgbotapi.Chat{ID: 1001},
+				From:      &tgbotapi.User{UserName: "admin"},
+				Text:      txt,
+			},
+		}
+		router.HandleUpdate(ctx, up)
+	}
+
+	callbackUp := tgbotapi.Update{
+		UpdateID: 701,
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			ID:   "cb_tools",
+			Data: "nav:tools",
+			From: &tgbotapi.User{UserName: "admin"},
+			Message: &tgbotapi.Message{
+				MessageID: 501,
+				Chat:      &tgbotapi.Chat{ID: 1001},
+			},
+		},
+	}
+	router.HandleUpdate(ctx, callbackUp)
+}

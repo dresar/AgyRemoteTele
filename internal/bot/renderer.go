@@ -163,7 +163,9 @@ func (r *Renderer) RenderHelp() string {
 	b.WriteString("• <code>/git [cmd]</code>, <code>/sh &lt;cmd&gt;</code>\n\n")
 
 	b.WriteString("<b>🤖 Local Agent & Auth:</b>\n")
-	b.WriteString("• <code>/ask &lt;prompt&gt;</code>, <code>/profile [id]</code>, <code>/history</code>, <code>/resume &lt;id&gt;</code>, <code>/new</code>\n")
+	b.WriteString("• <code>/ask &lt;prompt&gt;</code>, <code>/plan &lt;task&gt;</code>, <code>/boost [learn]</code>, <code>/teamwork &lt;task&gt;</code>\n")
+	b.WriteString("• <code>/tools</code>, <code>/continue</code>, <code>/new [prompt]</code>, <code>/profile [id]</code>, <code>/history</code>, <code>/resume &lt;id&gt;</code>\n")
+	b.WriteString("• <code>/kill</code> (terminate active AGY task or process PID)\n")
 	b.WriteString("• <code>/login &lt;key&gt;</code>, <code>/logout</code>")
 
 	return b.String()
@@ -668,6 +670,36 @@ func (r *Renderer) RenderSwarm(results []cluster.SwarmTaskResult) string {
 	return strings.TrimSpace(b.String())
 }
 
+func (r *Renderer) RenderTools() string {
+	var b strings.Builder
+	b.WriteString("<b>🛠 ANTIGRAVITY TOOLS & AUTONOMOUS ENGINE</b>\n\n")
+
+	b.WriteString("<b>⚡ Native Execution Tools:</b>\n")
+	b.WriteString("• <code>run_command</code> — Eksekusi command bash & terminal di VPS\n")
+	b.WriteString("• <code>read_file</code> / <code>view_file</code> — Membaca file dan konten kode\n")
+	b.WriteString("• <code>write_to_file</code> / <code>replace_file_content</code> — Menulis dan mengedit file kode\n")
+	b.WriteString("• <code>find_by_name</code> — Pencarian file berbasis pola nama (glob)\n")
+	b.WriteString("• <code>grep_search</code> — Pencarian regex cepat dengan ripgrep\n")
+	b.WriteString("• <code>list_dir</code> — Navigasi dan inspeksi struktur direktori\n")
+	b.WriteString("• <code>read_url_content</code> / <code>search_web</code> — Web fetch & pencarian informasi\n")
+	b.WriteString("• <code>manage_task</code> / <code>schedule</code> — Manajemen background task & timer\n")
+	b.WriteString("• <code>send_message</code> — Komunikasi antar-worker cluster\n\n")
+
+	b.WriteString("<b>🛡 Anti-Detection & Autonomous Engine:</b>\n")
+	b.WriteString("• <code>--dangerously-skip-permissions</code> — Bypass konfirmasi izin tools otomatis\n")
+	b.WriteString("• <code>Autonomous Operator Directive</code> — Otonomi penuh tanpa meminta izin berulang\n")
+	b.WriteString("• <code>Clean Output Stream</code> — Log CLI disupresi, hanya kirim jawaban bersih\n\n")
+
+	b.WriteString("<b>🧩 Specialized Cluster Skills:</b>\n")
+	b.WriteString("• <code>agy-code-review</code>, <code>agy-error-recovery</code>, <code>agy-git-worktree-workflow</code>\n")
+	b.WriteString("• <code>agy-incident-recovery</code>, <code>agy-merge-conflict-resolution</code>, <code>agy-operating-protocol</code>\n")
+	b.WriteString("• <code>agy-regression-risk-analysis</code>, <code>agy-resource-aware-execution</code>, <code>agy-result-verification</code>\n")
+	b.WriteString("• <code>agy-security-baseline</code>, <code>agy-task-boundaries</code>, <code>antislop</code>\n\n")
+
+	b.WriteString("<i>Semua tools terpasang dan otomatis dipahami oleh Antigravity untuk menyelesaikan setiap instruksi.</i>")
+	return b.String()
+}
+
 func (r *Renderer) GetStartKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -687,7 +719,10 @@ func (r *Renderer) GetStartKeyboard() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("📊 Usage", "nav:usage"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🛠 Tools AGY", "nav:tools"),
 			tgbotapi.NewInlineKeyboardButtonData("📁 Workspace", "nav:ls"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("❓ Help", "nav:help"),
 		),
 	)
