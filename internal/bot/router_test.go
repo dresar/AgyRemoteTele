@@ -249,3 +249,77 @@ func TestRouterSetters(t *testing.T) {
 		t.Errorf("swarm manager setter mismatch")
 	}
 }
+
+func TestRouterAuthorizedAdminAutoAuth(t *testing.T) {
+	router, store, _, _, _ := createTestRouter(t)
+	ctx := context.Background()
+
+	sess := store.GetOrCreate(1001, "admin")
+	if sess.IsAuthenticated {
+		t.Fatalf("expected initial session to be unauthenticated")
+	}
+
+	up := tgbotapi.Update{
+		UpdateID: 100,
+		Message: &tgbotapi.Message{
+			MessageID: 10,
+			Chat:      &tgbotapi.Chat{ID: 1001},
+			From:      &tgbotapi.User{UserName: "admin"},
+			Text:      "/start",
+			Entities: []tgbotapi.MessageEntity{
+				{
+					Type:   "bot_command",
+					Offset: 0,
+					Length: 6,
+				},
+			},
+		},
+	}
+
+	router.HandleUpdate(ctx, up)
+
+	updatedSess, exists := store.Get(1001)
+	if !exists {
+		t.Fatalf("session for 1001 should exist")
+	}
+	if !updatedSess.IsAuthenticated {
+		t.Errorf("expected sess.IsAuthenticated to be true for allowedChatID")
+	}
+}
+
+func TestRouterGuestAutoAuth(t *testing.T) {
+	router, store, _, _, _ := createTestRouter(t)
+	ctx := context.Background()
+
+	sess := store.GetOrCreate(2002, "guest")
+	if sess.IsAuthenticated {
+		t.Fatalf("expected initial guest session to be unauthenticated")
+	}
+
+	up := tgbotapi.Update{
+		UpdateID: 101,
+		Message: &tgbotapi.Message{
+			MessageID: 11,
+			Chat:      &tgbotapi.Chat{ID: 2002},
+			From:      &tgbotapi.User{UserName: "guest"},
+			Text:      "/start",
+			Entities: []tgbotapi.MessageEntity{
+				{
+					Type:   "bot_command",
+					Offset: 0,
+					Length: 6,
+				},
+			},
+		},
+	}
+
+	router.HandleUpdate(ctx, up)
+
+	updatedSess, exists := store.Get(2002)
+	if !exists {
+		t.Fatalf("session for 2002 should exist")
+	}
+	if updatedSess.IsAuthenticated {
+		t.Errorf("expected guest sess.IsAuthenticated to remain false")
+	}
+}

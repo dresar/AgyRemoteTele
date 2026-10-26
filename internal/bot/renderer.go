@@ -84,7 +84,7 @@ func (r *Renderer) RenderWelcome(username string, defaultProfile string, sess *s
 
 	profile := defaultProfile
 	workDir := "/opt/data/home"
-	statusBadge := "🟡 Unauthenticated"
+	sessionBadge := "🟡 Unpaired (Guest)"
 
 	if sess != nil {
 		if sess.ActiveProfile != "" {
@@ -94,11 +94,11 @@ func (r *Renderer) RenderWelcome(username string, defaultProfile string, sess *s
 			workDir = sess.ActiveWorkingDir
 		}
 		if sess.IsAuthenticated {
-			statusBadge = "🟢 Authenticated"
+			sessionBadge = "🟢 Authorized Admin"
 		}
 	}
 
-	b.WriteString(fmt.Sprintf("<b>Status:</b> %s\n", statusBadge))
+	b.WriteString(fmt.Sprintf("<b>Telegram Session:</b> %s\n", sessionBadge))
 	b.WriteString(fmt.Sprintf("<b>Active Worker:</b> <code>%s</code>\n", html.EscapeString(profile)))
 	b.WriteString(fmt.Sprintf("<b>Working Directory:</b> <code>%s</code>\n\n", html.EscapeString(workDir)))
 
