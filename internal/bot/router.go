@@ -21,7 +21,6 @@ import (
 	"github.com/dresar/AgyRemoteTele/internal/cluster"
 	"github.com/dresar/AgyRemoteTele/internal/docker"
 	"github.com/dresar/AgyRemoteTele/internal/nettools"
-	"github.com/dresar/AgyRemoteTele/internal/reporter"
 	"github.com/dresar/AgyRemoteTele/internal/scheduler"
 	"github.com/dresar/AgyRemoteTele/internal/session"
 	"github.com/dresar/AgyRemoteTele/internal/system"
@@ -657,26 +656,31 @@ func (r *Router) handleAsk(ctx context.Context, chatID int64, sess *session.Sess
 		return
 	}
 
-	rep := reporter.BuildReport(sess.ActiveProfile, result, sess.ActiveWorkingDir)
-	reportHTML := rep.RenderHTML()
-
 	var sentIDs []int
 
-	msgRep := tgbotapi.NewMessage(chatID, reportHTML)
-	msgRep.ParseMode = tgbotapi.ModeHTML
-	if sent, err := r.api.Send(msgRep); err == nil {
-		sentIDs = append(sentIDs, sent.MessageID)
+	responseText := ""
+	if result != nil {
+		responseText = strings.TrimSpace(result.Response)
+	}
+	if responseText == "" {
+		responseText = "Execution finished with no text output."
 	}
 
-	if result.Response != "" {
-		respHeader := fmt.Sprintf("<b>💬 Agent Response:</b>\n\n%s", html.EscapeString(result.Response))
-		chunks := r.renderer.ChunkMessage(respHeader, 4000)
-		for _, chunk := range chunks {
-			msg := tgbotapi.NewMessage(chatID, chunk)
-			msg.ParseMode = tgbotapi.ModeHTML
-			if sent, err := r.api.Send(msg); err == nil {
-				sentIDs = append(sentIDs, sent.MessageID)
+	chunks := r.renderer.ChunkMessage(html.EscapeString(responseText), 4000)
+	for _, chunk := range chunks {
+		msg := tgbotapi.NewMessage(chatID, chunk)
+		msg.ParseMode = tgbotapi.ModeHTML
+		if sent, err := r.api.Send(msg); err == nil {
+			sentIDs = append(sentIDs, sent.MessageID)
+		} else {
+			rawChunks := r.renderer.ChunkMessage(responseText, 4000)
+			for _, rawChunk := range rawChunks {
+				rawMsg := tgbotapi.NewMessage(chatID, rawChunk)
+				if fallbackSent, fallbackErr := r.api.Send(rawMsg); fallbackErr == nil {
+					sentIDs = append(sentIDs, fallbackSent.MessageID)
+				}
 			}
+			break
 		}
 	}
 
