@@ -88,7 +88,7 @@ func main() {
 		HighMemThreshold:    85.0,
 		CritMemThreshold:    92.0,
 		HighDiskThreshold:   90.0,
-		TokenWarningMinutes: 30,
+		TokenWarningMinutes: 5,
 	}
 
 	var botInstance *bot.Bot

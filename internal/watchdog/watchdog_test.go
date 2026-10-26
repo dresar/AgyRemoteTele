@@ -251,6 +251,47 @@ func TestWatchdogAutoRefreshStillExpired(t *testing.T) {
 	}
 }
 
+func TestWatchdogAutoRefreshActiveRemainingNoAlert(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createMockToken(t, tmpDir, "agy02", time.Now().Add(4*time.Minute))
+
+	cfg := AlertConfig{
+		TokenWarningMinutes: 5,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+
+	w.mu.Lock()
+	w.lastNotified["TOKEN_agy02:WARNING"] = time.Now().Add(-1 * time.Minute)
+	w.lastNotified["TOKEN_agy02:CRITICAL"] = time.Now().Add(-1 * time.Minute)
+	w.mu.Unlock()
+
+	refreshCalled := false
+	w.AutoRefreshFunc = func(name string) error {
+		refreshCalled = true
+		return nil
+	}
+
+	alerts := w.checkTokens()
+	if !refreshCalled {
+		t.Fatalf("expected auto-refresh to be invoked")
+	}
+
+	if len(alerts) != 0 {
+		t.Fatalf("expected 0 alerts when token still has active remaining time, got %d: %v", len(alerts), alerts)
+	}
+
+	w.mu.RLock()
+	_, hasWarn := w.lastNotified["TOKEN_agy02:WARNING"]
+	_, hasCrit := w.lastNotified["TOKEN_agy02:CRITICAL"]
+	w.mu.RUnlock()
+
+	if hasWarn || hasCrit {
+		t.Errorf("expected lastNotified to be cleared for agy02, got warn=%v crit=%v", hasWarn, hasCrit)
+	}
+}
+
 func TestWatchdogDeduplication(t *testing.T) {
 	tmpDir := t.TempDir()
 	critMem := createMockMeminfo(t, tmpDir, 10000, 500)

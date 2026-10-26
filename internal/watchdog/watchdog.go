@@ -319,8 +319,8 @@ func (w *Watchdog) checkTokens() []AlertEvent {
 				}
 
 				newRem := newExp.Sub(time.Now())
-				if newRem > warnDuration {
-					log.Printf("Token for %s successfully auto-refreshed (valid for %d minutes)", name, int(newRem.Minutes()))
+				if newRem > 0 {
+					log.Printf("Token for %s is valid (%d minutes remaining)", name, int(newRem.Minutes()))
 					w.mu.Lock()
 					delete(w.lastNotified, fmt.Sprintf("TOKEN_%s:WARNING", name))
 					delete(w.lastNotified, fmt.Sprintf("TOKEN_%s:CRITICAL", name))
