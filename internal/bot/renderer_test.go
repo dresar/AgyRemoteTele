@@ -11,6 +11,7 @@ import (
 	"github.com/dresar/AgyRemoteTele/internal/docker"
 	"github.com/dresar/AgyRemoteTele/internal/nettools"
 	"github.com/dresar/AgyRemoteTele/internal/scheduler"
+	"github.com/dresar/AgyRemoteTele/internal/session"
 	"github.com/dresar/AgyRemoteTele/internal/system"
 	"github.com/dresar/AgyRemoteTele/internal/watchdog"
 )
@@ -395,5 +396,64 @@ func TestKeyboards(t *testing.T) {
 		if len(kb.InlineKeyboard) == 0 {
 			t.Errorf("expected non-empty category keyboard for %s", c)
 		}
+	}
+}
+
+func TestRenderWelcome(t *testing.T) {
+	r := NewRenderer()
+
+	tests := []struct {
+		name           string
+		username       string
+		defaultProfile string
+		sess           *session.Session
+		wantStatus     string
+		wantWorker     string
+	}{
+		{
+			name:           "NilSession",
+			username:       "bot",
+			defaultProfile: "agy01",
+			sess:           nil,
+			wantStatus:     "<b>Telegram Session:</b> 🟡 Unpaired (Guest)",
+			wantWorker:     "<b>Active Worker:</b> <code>agy01</code>",
+		},
+		{
+			name:           "GuestUnpaired",
+			username:       "bot",
+			defaultProfile: "agy01",
+			sess: &session.Session{
+				IsAuthenticated: false,
+				ActiveProfile:   "agy02",
+			},
+			wantStatus: "<b>Telegram Session:</b> 🟡 Unpaired (Guest)",
+			wantWorker: "<b>Active Worker:</b> <code>agy02</code>",
+		},
+		{
+			name:           "AuthorizedAdmin",
+			username:       "bot",
+			defaultProfile: "agy01",
+			sess: &session.Session{
+				IsAuthenticated: true,
+				ActiveProfile:   "agy01",
+			},
+			wantStatus: "<b>Telegram Session:</b> 🟢 Authorized Admin",
+			wantWorker: "<b>Active Worker:</b> <code>agy01</code>",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := r.RenderWelcome(tc.username, tc.defaultProfile, tc.sess)
+			if !strings.Contains(out, tc.wantStatus) {
+				t.Errorf("RenderWelcome() status mismatch, want %q in output:\n%s", tc.wantStatus, out)
+			}
+			if !strings.Contains(out, tc.wantWorker) {
+				t.Errorf("RenderWelcome() worker mismatch, want %q in output:\n%s", tc.wantWorker, out)
+			}
+			if strings.Contains(out, "Status: 🟡") || strings.Contains(out, "Status: 🟢") {
+				t.Errorf("RenderWelcome() should not contain legacy Status label:\n%s", out)
+			}
+		})
 	}
 }

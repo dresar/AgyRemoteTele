@@ -112,6 +112,13 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
+	if r.authManager != nil && r.authManager.IsAuthorized(chatID, sess, 0) && sess != nil && !sess.IsAuthenticated {
+		sess.IsAuthenticated = true
+		if r.sessionStore != nil {
+			r.sessionStore.Authenticate(chatID)
+		}
+	}
+
 	r.cleanupPreviousMessages(chatID, sess)
 
 	if strings.HasPrefix(text, "/resume_") {
@@ -810,6 +817,13 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 		callbackResp := tgbotapi.NewCallback(cb.ID, "Unauthorized device")
 		_, _ = r.api.Request(callbackResp)
 		return
+	}
+
+	if r.authManager != nil && r.authManager.IsAuthorized(chatID, sess, 0) && sess != nil && !sess.IsAuthenticated {
+		sess.IsAuthenticated = true
+		if r.sessionStore != nil {
+			r.sessionStore.Authenticate(chatID)
+		}
 	}
 
 	callbackResp := tgbotapi.NewCallback(cb.ID, "")
