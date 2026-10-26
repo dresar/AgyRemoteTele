@@ -176,3 +176,33 @@ func TestQuickStatusDirectInspection(t *testing.T) {
 		t.Errorf("expected agy02 to be expired, got %s", statuses["agy02"])
 	}
 }
+
+func TestSwarmManagerCanonicalFiltering(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	canonical := []string{"agy01", "agy02", "agy10"}
+	nonCanonical := []string{"account1", "account05", "ORCHESTRATOR", "orchestrator_tasks", "random_profile"}
+
+	for _, name := range append(canonical, nonCanonical...) {
+		pdir := filepath.Join(tmpDir, name, ".gemini/antigravity-cli")
+		if err := os.MkdirAll(pdir, 0755); err != nil {
+			t.Fatalf("failed to create dir: %v", err)
+		}
+	}
+
+	sm := NewSwarmManager(tmpDir, "")
+	accounts, err := sm.discoverAccounts()
+	if err != nil {
+		t.Fatalf("discoverAccounts failed: %v", err)
+	}
+
+	if len(accounts) != len(canonical) {
+		t.Fatalf("expected %d canonical accounts, got %d: %v", len(canonical), len(accounts), accounts)
+	}
+
+	for i, acc := range canonical {
+		if accounts[i] != acc {
+			t.Errorf("expected %s, got %s", acc, accounts[i])
+		}
+	}
+}

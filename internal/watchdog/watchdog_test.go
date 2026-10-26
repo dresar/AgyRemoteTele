@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +42,7 @@ func TestWatchdogMeminfoThresholds(t *testing.T) {
 		CritMemThreshold: 92.0,
 	}
 	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(filepath.Join(tmpDir, "empty"))
 
 	normalMem := createMockMeminfo(t, tmpDir, 10000, 3000)
 	w.SetMeminfoPath(normalMem)
@@ -108,6 +110,7 @@ func TestWatchdogTokenAlerts(t *testing.T) {
 		TokenWarningMinutes: 15,
 	}
 	w := NewWatchdog(cfg, nil)
+	w.AutoRefreshFunc = nil
 	w.SetProfilesRoot(tmpDir)
 
 	alerts := w.checkTokens()
@@ -130,6 +133,121 @@ func TestWatchdogTokenAlerts(t *testing.T) {
 	}
 	if !hasCrit {
 		t.Errorf("expected CRITICAL alert for agy03")
+	}
+}
+
+func TestWatchdogCanonicalProfileFiltering(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createMockToken(t, tmpDir, "agy01", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "account1", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "account01", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "account10", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "ORCHESTRATOR", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "random_dir", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, ".git", time.Now().Add(-10*time.Minute))
+	createMockToken(t, tmpDir, "orchestrator_tasks", time.Now().Add(-10*time.Minute))
+
+	cfg := AlertConfig{
+		TokenWarningMinutes: 15,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.AutoRefreshFunc = nil
+	w.SetProfilesRoot(tmpDir)
+
+	alerts := w.checkTokens()
+	if len(alerts) != 1 {
+		t.Fatalf("expected exactly 1 alert for agy01, got %d alerts: %v", len(alerts), alerts)
+	}
+
+	if alerts[0].Metric != "TOKEN_agy01" {
+		t.Errorf("expected alert for TOKEN_agy01, got %s", alerts[0].Metric)
+	}
+}
+
+func TestWatchdogAutoRefreshSuccess(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createMockToken(t, tmpDir, "agy02", time.Now().Add(5*time.Minute))
+
+	cfg := AlertConfig{
+		TokenWarningMinutes: 15,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+
+	var refreshedProfile string
+	w.AutoRefreshFunc = func(name string) error {
+		refreshedProfile = name
+		createMockToken(t, tmpDir, name, time.Now().Add(2*time.Hour))
+		return nil
+	}
+
+	alerts := w.checkTokens()
+	if len(alerts) != 0 {
+		t.Fatalf("expected 0 alerts after successful auto-refresh, got %d: %v", len(alerts), alerts)
+	}
+
+	if refreshedProfile != "agy02" {
+		t.Errorf("expected agy02 to be refreshed, got %s", refreshedProfile)
+	}
+}
+
+func TestWatchdogAutoRefreshFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createMockToken(t, tmpDir, "agy04", time.Now().Add(-5*time.Minute))
+
+	cfg := AlertConfig{
+		TokenWarningMinutes: 15,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+
+	w.AutoRefreshFunc = func(name string) error {
+		return fmt.Errorf("oauth token refresh rejected")
+	}
+
+	alerts := w.checkTokens()
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert on refresh failure, got %d", len(alerts))
+	}
+
+	if alerts[0].Level != "CRITICAL" {
+		t.Errorf("expected CRITICAL level, got %s", alerts[0].Level)
+	}
+
+	if !strings.Contains(alerts[0].Message, "Token refresh failed for agy04") {
+		t.Errorf("expected failure message, got: %s", alerts[0].Message)
+	}
+}
+
+func TestWatchdogAutoRefreshStillExpired(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createMockToken(t, tmpDir, "agy05", time.Now().Add(-5*time.Minute))
+
+	cfg := AlertConfig{
+		TokenWarningMinutes: 15,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+
+	w.AutoRefreshFunc = func(name string) error {
+		return nil
+	}
+
+	alerts := w.checkTokens()
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert when token is still expired, got %d", len(alerts))
+	}
+
+	if alerts[0].Level != "CRITICAL" {
+		t.Errorf("expected CRITICAL level, got %s", alerts[0].Level)
+	}
+
+	if !strings.Contains(alerts[0].Message, "Token refresh failed for agy05") {
+		t.Errorf("expected failure message, got: %s", alerts[0].Message)
 	}
 }
 

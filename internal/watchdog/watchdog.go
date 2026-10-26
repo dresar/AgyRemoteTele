@@ -6,14 +6,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+var profileRegex = regexp.MustCompile(`^agy(0[1-9]|1[0-5])$`)
 
 type AlertConfig struct {
 	CheckInterval       time.Duration
@@ -33,18 +38,26 @@ type AlertEvent struct {
 }
 
 type Watchdog struct {
-	mu           sync.RWMutex
-	cfg          AlertConfig
-	notifyFunc   func(level string, title string, message string)
-	recentAlerts []AlertEvent
-	lastNotified map[string]time.Time
-	cooldown     time.Duration
-	profilesRoot string
-	meminfoPath  string
-	diskPath     string
-	stopChan     chan struct{}
-	running      bool
-	wg           sync.WaitGroup
+	mu              sync.RWMutex
+	cfg             AlertConfig
+	notifyFunc      func(level string, title string, message string)
+	recentAlerts    []AlertEvent
+	lastNotified    map[string]time.Time
+	cooldown        time.Duration
+	profilesRoot    string
+	meminfoPath     string
+	diskPath        string
+	stopChan        chan struct{}
+	running         bool
+	wg              sync.WaitGroup
+	AutoRefreshFunc func(name string) error
+}
+
+func defaultAutoRefresh(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "refresh", name)
+	return cmd.Run()
 }
 
 func NewWatchdog(cfg AlertConfig, notifyFunc func(level string, title string, message string)) *Watchdog {
@@ -65,14 +78,15 @@ func NewWatchdog(cfg AlertConfig, notifyFunc func(level string, title string, me
 	}
 
 	return &Watchdog{
-		cfg:          cfg,
-		notifyFunc:   notifyFunc,
-		recentAlerts: make([]AlertEvent, 0),
-		lastNotified: make(map[string]time.Time),
-		cooldown:     15 * time.Minute,
-		profilesRoot: "/opt/data/home/agy-profiles",
-		meminfoPath:  "/proc/meminfo",
-		diskPath:     "/",
+		cfg:             cfg,
+		notifyFunc:      notifyFunc,
+		recentAlerts:    make([]AlertEvent, 0),
+		lastNotified:    make(map[string]time.Time),
+		cooldown:        15 * time.Minute,
+		profilesRoot:    "/opt/data/home/agy-profiles",
+		meminfoPath:     "/proc/meminfo",
+		diskPath:        "/",
+		AutoRefreshFunc: defaultAutoRefresh,
 	}
 }
 
@@ -98,6 +112,12 @@ func (w *Watchdog) SetCooldown(d time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.cooldown = d
+}
+
+func (w *Watchdog) SetAutoRefreshFunc(fn func(name string) error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.AutoRefreshFunc = fn
 }
 
 func (w *Watchdog) Start(ctx context.Context) {
@@ -245,6 +265,7 @@ func (w *Watchdog) checkTokens() []AlertEvent {
 	w.mu.RLock()
 	root := w.profilesRoot
 	warnMin := w.cfg.TokenWarningMinutes
+	refreshFn := w.AutoRefreshFunc
 	w.mu.RUnlock()
 
 	entries, err := os.ReadDir(root)
@@ -261,6 +282,9 @@ func (w *Watchdog) checkTokens() []AlertEvent {
 			continue
 		}
 		name := entry.Name()
+		if !profileRegex.MatchString(name) {
+			continue
+		}
 		tokenPath := filepath.Join(root, name, ".gemini/antigravity-cli/antigravity-oauth-token")
 		exp, err := readTokenExpiry(tokenPath)
 		if err != nil || exp.IsZero() {
@@ -269,6 +293,51 @@ func (w *Watchdog) checkTokens() []AlertEvent {
 
 		rem := exp.Sub(now)
 		if rem <= warnDuration {
+			if refreshFn != nil {
+				refreshErr := refreshFn(name)
+				if refreshErr != nil {
+					alerts = append(alerts, AlertEvent{
+						ID:        fmt.Sprintf("token_%s_%d", name, time.Now().UnixNano()),
+						Timestamp: now,
+						Level:     "CRITICAL",
+						Metric:    fmt.Sprintf("TOKEN_%s", name),
+						Message:   fmt.Sprintf("Token refresh failed for %s: %v", name, refreshErr),
+					})
+					continue
+				}
+
+				newExp, err := readTokenExpiry(tokenPath)
+				if err != nil || newExp.IsZero() {
+					alerts = append(alerts, AlertEvent{
+						ID:        fmt.Sprintf("token_%s_%d", name, time.Now().UnixNano()),
+						Timestamp: now,
+						Level:     "CRITICAL",
+						Metric:    fmt.Sprintf("TOKEN_%s", name),
+						Message:   fmt.Sprintf("Token refresh failed for %s: %v", name, err),
+					})
+					continue
+				}
+
+				newRem := newExp.Sub(time.Now())
+				if newRem > warnDuration {
+					log.Printf("Token for %s successfully auto-refreshed (valid for %d minutes)", name, int(newRem.Minutes()))
+					w.mu.Lock()
+					delete(w.lastNotified, fmt.Sprintf("TOKEN_%s:WARNING", name))
+					delete(w.lastNotified, fmt.Sprintf("TOKEN_%s:CRITICAL", name))
+					w.mu.Unlock()
+					continue
+				}
+
+				alerts = append(alerts, AlertEvent{
+					ID:        fmt.Sprintf("token_%s_%d", name, time.Now().UnixNano()),
+					Timestamp: now,
+					Level:     "CRITICAL",
+					Metric:    fmt.Sprintf("TOKEN_%s", name),
+					Message:   fmt.Sprintf("Token refresh failed for %s: token still expired", name),
+				})
+				continue
+			}
+
 			level := "WARNING"
 			msg := fmt.Sprintf("Token for %s expires in %d minutes", name, int(rem.Minutes()))
 			if rem <= 0 {

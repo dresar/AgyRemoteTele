@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var profileRegex = regexp.MustCompile(`^(agy|account)(0[1-9]|1[0-5]|[1-9])$`)
+var profileRegex = regexp.MustCompile(`^agy(0[1-9]|1[0-5])$`)
 
 type SwarmTaskResult struct {
 	Account  string        `json:"account"`
@@ -224,7 +224,7 @@ func parseWorkersOutput(out string) map[string]string {
 			profile := strings.TrimSpace(parts[0])
 			auth := strings.TrimSpace(parts[2])
 			daemon := strings.TrimSpace(parts[3])
-			if profile != "" {
+			if profile != "" && profileRegex.MatchString(profile) {
 				statusMap[profile] = fmt.Sprintf("%s, %s", auth, daemon)
 			}
 		}
