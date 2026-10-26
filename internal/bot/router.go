@@ -9,15 +9,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/dresar/AgyRemoteTele/internal/agy"
+	"github.com/dresar/AgyRemoteTele/internal/backup"
+	"github.com/dresar/AgyRemoteTele/internal/cluster"
+	"github.com/dresar/AgyRemoteTele/internal/docker"
+	"github.com/dresar/AgyRemoteTele/internal/nettools"
 	"github.com/dresar/AgyRemoteTele/internal/reporter"
+	"github.com/dresar/AgyRemoteTele/internal/scheduler"
 	"github.com/dresar/AgyRemoteTele/internal/session"
 	"github.com/dresar/AgyRemoteTele/internal/system"
+	"github.com/dresar/AgyRemoteTele/internal/watchdog"
 	"github.com/dresar/AgyRemoteTele/internal/workspace"
 )
 
@@ -31,6 +39,9 @@ type Router struct {
 	renderer       *Renderer
 	middleware     *Middleware
 	execTimeout    time.Duration
+	scheduler      *scheduler.Scheduler
+	watchdog       *watchdog.Watchdog
+	swarmManager   *cluster.SwarmManager
 }
 
 func NewRouter(
@@ -55,6 +66,18 @@ func NewRouter(
 		middleware:     middleware,
 		execTimeout:    execTimeout,
 	}
+}
+
+func (r *Router) SetScheduler(s *scheduler.Scheduler) {
+	r.scheduler = s
+}
+
+func (r *Router) SetWatchdog(w *watchdog.Watchdog) {
+	r.watchdog = w
+}
+
+func (r *Router) SetSwarmManager(sm *cluster.SwarmManager) {
+	r.swarmManager = sm
 }
 
 func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
@@ -97,6 +120,18 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
+	if strings.HasPrefix(text, "/cron_run_") {
+		jobID := strings.TrimPrefix(text, "/cron_run_")
+		r.handleCronRun(ctx, chatID, jobID)
+		return
+	}
+
+	if strings.HasPrefix(text, "/cron_rm_") {
+		jobID := strings.TrimPrefix(text, "/cron_rm_")
+		r.handleCronRemove(chatID, jobID)
+		return
+	}
+
 	if text == "/" {
 		r.handleHelp(chatID)
 		return
@@ -110,6 +145,32 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		r.handleStart(chatID, sess)
 	case "help":
 		r.handleHelp(chatID)
+	case "ps", "procs":
+		r.handleProcesses(chatID, sess, args)
+	case "kill":
+		r.handleKill(chatID, args)
+	case "ports", "netstat":
+		r.handlePorts(chatID)
+	case "service":
+		r.handleServices(ctx, chatID, args)
+	case "ping":
+		r.handlePing(ctx, chatID, args)
+	case "curl", "http":
+		r.handleHTTP(ctx, chatID, args)
+	case "dns":
+		r.handleDNS(ctx, chatID, args)
+	case "netio":
+		r.handleNetIO(chatID)
+	case "docker":
+		r.handleDocker(ctx, chatID, args)
+	case "cron":
+		r.handleCron(ctx, chatID, args)
+	case "alerts":
+		r.handleAlerts(chatID)
+	case "backup":
+		r.handleBackup(chatID, sess, args)
+	case "swarm":
+		r.handleSwarm(ctx, chatID, sess, args)
 	case "login":
 		if args != "" && (r.authManager.ValidateAdminKey(args) || r.authManager.ConsumePairingToken(args)) {
 			r.sessionStore.Authenticate(chatID)
@@ -177,7 +238,7 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 }
 
 func (r *Router) cleanupPreviousMessages(chatID int64, sess *session.Session) {
-	if sess == nil || len(sess.LastBotMessageIDs) == 0 {
+	if sess == nil || len(sess.LastBotMessageIDs) == 0 || r.api == nil {
 		return
 	}
 	for _, msgID := range sess.LastBotMessageIDs {
@@ -188,50 +249,29 @@ func (r *Router) cleanupPreviousMessages(chatID int64, sess *session.Session) {
 }
 
 func (r *Router) getStartMenuMarkup() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("⚡ Status", "nav:status"),
-			tgbotapi.NewInlineKeyboardButtonData("👤 Profiles", "nav:profile"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("👥 Accounts", "nav:accounts"),
-			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "nav:refresh"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🤖 Workers", "nav:workers"),
-			tgbotapi.NewInlineKeyboardButtonData("📊 Usage", "nav:usage"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📋 Tasks", "nav:tasks"),
-			tgbotapi.NewInlineKeyboardButtonData("📜 History", "nav:history"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📁 Workspace", "nav:ls"),
-			tgbotapi.NewInlineKeyboardButtonData("🌿 Git", "nav:git"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("❓ Help", "nav:help"),
-		),
-	)
+	return r.renderer.GetStartKeyboard()
 }
 
 func (r *Router) getBackMarkup() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
-		),
-	)
+	return r.renderer.GetBackKeyboard()
 }
 
 func (r *Router) handleStart(chatID int64, sess *session.Session) {
-	text := r.renderer.RenderWelcome(r.api.Self.UserName, sess.ActiveProfile, sess)
+	botUsername := "AgyRemoteTeleBot"
+	if r.api != nil {
+		botUsername = r.api.Self.UserName
+	}
+	text := r.renderer.RenderWelcome(botUsername, sess.ActiveProfile, sess)
 	keyboard := r.getStartMenuMarkup()
 
+	if r.api == nil {
+		return
+	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = keyboard
 	sent, err := r.api.Send(msg)
-	if err == nil {
+	if err == nil && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
 	}
 }
@@ -773,10 +813,16 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 	}
 
 	callbackResp := tgbotapi.NewCallback(cb.ID, "")
-	_, _ = r.api.Request(callbackResp)
+	if r.api != nil {
+		_, _ = r.api.Request(callbackResp)
+	}
 
 	if data == "nav:start" {
-		text := r.renderer.RenderWelcome(r.api.Self.UserName, sess.ActiveProfile, sess)
+		botUsername := "AgyRemoteTeleBot"
+		if r.api != nil {
+			botUsername = r.api.Self.UserName
+		}
+		text := r.renderer.RenderWelcome(botUsername, sess.ActiveProfile, sess)
 		markup := r.getStartMenuMarkup()
 		r.editMessage(chatID, msgID, text, &markup)
 		return
@@ -808,7 +854,150 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 		return
 	}
 
+	if strings.HasPrefix(data, "cron_run:") {
+		target := strings.TrimPrefix(data, "cron_run:")
+		r.handleCronRun(ctx, chatID, target)
+		return
+	}
+
+	if strings.HasPrefix(data, "cron_rm:") {
+		target := strings.TrimPrefix(data, "cron_rm:")
+		r.handleCronRemove(chatID, target)
+		return
+	}
+
 	switch data {
+	case "nav:cat_system":
+		text := "<b>💻 SYSTEM & OS CONTROL</b>\n\nMonitor active processes, network listening ports, system services, and watchdog alerts."
+		markup := r.renderer.GetCategoryKeyboard("system")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cat_docker":
+		text := "<b>🐳 DOCKER CONTAINER MANAGEMENT</b>\n\nInspect container states, live resource consumption, and logs."
+		markup := r.renderer.GetCategoryKeyboard("docker")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cat_net":
+		text := "<b>🌐 NETWORK TOOLS & DIAGNOSTICS</b>\n\nNetwork interface traffic, ICMP ping testing, and DNS lookups."
+		markup := r.renderer.GetCategoryKeyboard("net")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cat_scheduler":
+		text := "<b>⏱ TASK SCHEDULER & CRON</b>\n\nView scheduled jobs or manage recurring tasks."
+		markup := r.renderer.GetCategoryKeyboard("scheduler")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cat_swarm":
+		text := "<b>🐝 CLUSTER SWARM ORCHESTRATION</b>\n\nMulti-worker status, task queue, and resource metrics."
+		markup := r.renderer.GetCategoryKeyboard("swarm")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cat_backup":
+		text := "<b>📦 BACKUP & ARCHIVAL</b>\n\nCreate tar.gz archives of workspace directories."
+		markup := r.renderer.GetCategoryKeyboard("backup")
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:ps":
+		procs, err := system.ListProcesses(15, "cpu")
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Process List Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderProcesses(procs)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:ports":
+		ports, err := system.ListListeningPorts()
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Ports Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderListeningPorts(ports)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:services":
+		services, err := system.ListCommonServices(ctx)
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Service Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderServices(services)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:alerts":
+		var alerts []watchdog.AlertEvent
+		if r.watchdog != nil {
+			alerts = r.watchdog.GetRecentAlerts()
+			if len(alerts) == 0 {
+				alerts = r.watchdog.CheckNow()
+			}
+		}
+		text := r.renderer.RenderAlerts(alerts)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:docker_ps":
+		containers, err := docker.ListContainers(ctx, true)
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Docker PS Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderContainers(containers)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:docker_stats":
+		stats, err := docker.GetContainerStats(ctx)
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Docker Stats Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderContainerStats(stats)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:netio":
+		netStats, err := nettools.GetNetworkIO()
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Net I/O Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderNetworkIO(netStats)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:ping_default":
+		res, err := nettools.Ping(ctx, "1.1.1.1", 3)
+		text := ""
+		if err != nil {
+			text = fmt.Sprintf("<b>🔴 Ping Error:</b> %s", html.EscapeString(err.Error()))
+		} else {
+			text = r.renderer.RenderPing(res)
+		}
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:cron_list":
+		var jobs []*scheduler.CronJob
+		if r.scheduler != nil {
+			jobs = r.scheduler.ListJobs()
+		}
+		text := r.renderer.RenderCronJobs(jobs)
+		markup := r.getBackMarkup()
+		r.editMessage(chatID, msgID, text, &markup)
+
+	case "nav:backup_now":
+		r.handleBackup(chatID, sess, "")
+
 	case "nav:status":
 		metrics, err := system.CollectMetrics(sess.ActiveWorkingDir)
 		text := ""
@@ -887,6 +1076,9 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 }
 
 func (r *Router) editMessage(chatID int64, msgID int, text string, markup *tgbotapi.InlineKeyboardMarkup) {
+	if r.api == nil {
+		return
+	}
 	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	edit.ParseMode = tgbotapi.ModeHTML
 	if markup != nil {
@@ -896,26 +1088,35 @@ func (r *Router) editMessage(chatID int64, msgID int, text string, markup *tgbot
 }
 
 func (r *Router) replyHTML(chatID int64, text string) {
+	if r.api == nil {
+		return
+	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	sent, err := r.api.Send(msg)
-	if err == nil {
+	if err == nil && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
 	}
 }
 
 func (r *Router) replyHTMLWithBack(chatID int64, text string) {
+	if r.api == nil {
+		return
+	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	markup := r.getBackMarkup()
 	msg.ReplyMarkup = markup
 	sent, err := r.api.Send(msg)
-	if err == nil {
+	if err == nil && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
 	}
 }
 
 func (r *Router) replyChunks(chatID int64, text string) {
+	if r.api == nil {
+		return
+	}
 	chunks := r.renderer.ChunkMessage(text, 4000)
 	var ids []int
 	for _, chunk := range chunks {
@@ -925,19 +1126,25 @@ func (r *Router) replyChunks(chatID int64, text string) {
 			ids = append(ids, sent.MessageID)
 		}
 	}
-	if len(ids) > 0 {
+	if len(ids) > 0 && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, ids)
 	}
 }
 
 func (r *Router) sendTyping(chatID int64) {
+	if r.api == nil {
+		return
+	}
 	action := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
 	_, _ = r.api.Send(action)
 }
 
 func (r *Router) sendDocument(chatID int64, filePath string) {
+	if r.api == nil {
+		return
+	}
 	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
-	if sent, err := r.api.Send(doc); err == nil {
+	if sent, err := r.api.Send(doc); err == nil && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
 	}
 }
@@ -950,11 +1157,14 @@ func truncateString(s string, max int) string {
 }
 
 func (r *Router) replyHTMLWithMarkup(chatID int64, text string, markup tgbotapi.InlineKeyboardMarkup) {
+	if r.api == nil {
+		return
+	}
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = markup
 	sent, err := r.api.Send(msg)
-	if err == nil {
+	if err == nil && r.sessionStore != nil {
 		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
 	}
 }
@@ -1478,4 +1688,412 @@ func (r *Router) handleUsage(ctx context.Context, chatID int64) {
 	b.WriteString(fmt.Sprintf("• <b>Daemon Aktif:</b> <code>%d/10</code>", activeDaemons))
 
 	r.replyHTMLWithBack(chatID, b.String())
+}
+
+func (r *Router) handleProcesses(chatID int64, sess *session.Session, args string) {
+	topN := 15
+	sortBy := "cpu"
+	parts := strings.Fields(args)
+	if len(parts) > 0 {
+		if n, err := strconv.Atoi(parts[0]); err == nil && n > 0 {
+			topN = n
+			if topN > 50 {
+				topN = 50
+			}
+		} else {
+			sortBy = strings.ToLower(parts[0])
+		}
+	}
+	if len(parts) > 1 {
+		sortBy = strings.ToLower(parts[1])
+	}
+	procs, err := system.ListProcesses(topN, sortBy)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Process List Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderProcesses(procs))
+}
+
+func (r *Router) handleKill(chatID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/kill &lt;pid&gt; [signal]</code>\nExample: <code>/kill 12345 9</code> or <code>/kill 12345 SIGTERM</code>")
+		return
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil || pid <= 0 {
+		r.replyHTML(chatID, "<b>🔴 Invalid PID:</b> Must be a positive integer.")
+		return
+	}
+	sig := syscall.SIGTERM
+	if len(parts) > 1 {
+		sStr := strings.ToUpper(parts[1])
+		switch sStr {
+		case "9", "SIGKILL", "KILL":
+			sig = syscall.SIGKILL
+		case "15", "SIGTERM", "TERM":
+			sig = syscall.SIGTERM
+		case "1", "SIGHUP", "HUP":
+			sig = syscall.SIGHUP
+		case "2", "SIGINT", "INT":
+			sig = syscall.SIGINT
+		default:
+			if n, err := strconv.Atoi(sStr); err == nil {
+				sig = syscall.Signal(n)
+			}
+		}
+	}
+	if err := system.KillProcess(pid, sig); err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Kill Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Process Terminated:</b> PID <code>%d</code> sent signal <code>%d</code>.", pid, sig))
+}
+
+func (r *Router) handlePorts(chatID int64) {
+	ports, err := system.ListListeningPorts()
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Ports Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderListeningPorts(ports))
+}
+
+func (r *Router) handleServices(ctx context.Context, chatID int64, args string) {
+	parts := strings.Fields(args)
+	subcmd := "list"
+	serviceName := ""
+	if len(parts) > 0 {
+		subcmd = strings.ToLower(parts[0])
+	}
+	if len(parts) > 1 {
+		serviceName = parts[1]
+	}
+
+	switch subcmd {
+	case "restart":
+		if serviceName == "" {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/service restart &lt;service_name&gt;</code>\nAllowed services: docker, nginx, cloudflared, cron")
+			return
+		}
+		out, err := system.RestartService(ctx, serviceName)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Service Restart Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Service Restarted:</b> <code>%s</code>\n<pre><code>%s</code></pre>", html.EscapeString(serviceName), html.EscapeString(out)))
+	case "list", "status":
+		fallthrough
+	default:
+		services, err := system.ListCommonServices(ctx)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Service Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		r.replyHTMLWithBack(chatID, r.renderer.RenderServices(services))
+	}
+}
+
+func (r *Router) handlePing(ctx context.Context, chatID int64, args string) {
+	host := strings.TrimSpace(args)
+	if host == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/ping &lt;host&gt;</code>\nExample: <code>/ping 1.1.1.1</code> or <code>/ping google.com</code>")
+		return
+	}
+	res, err := nettools.Ping(ctx, host, 3)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Ping Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderPing(res))
+}
+
+func (r *Router) handleHTTP(ctx context.Context, chatID int64, args string) {
+	targetURL := strings.TrimSpace(args)
+	if targetURL == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/curl &lt;url&gt;</code> or <code>/http &lt;url&gt;</code>\nExample: <code>/curl https://google.com</code>")
+		return
+	}
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		targetURL = "https://" + targetURL
+	}
+	res, err := nettools.ProbeHTTP(ctx, targetURL, 15*time.Second)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 HTTP Probe Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderHTTPProbe(res))
+}
+
+func (r *Router) handleDNS(ctx context.Context, chatID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/dns &lt;domain&gt; [type]</code>\nExample: <code>/dns google.com A</code> or <code>/dns cloudflare.com MX</code>")
+		return
+	}
+	domain := parts[0]
+	recType := "A"
+	if len(parts) > 1 {
+		recType = strings.ToUpper(parts[1])
+	}
+	recs, err := nettools.LookupDNS(ctx, domain, recType)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 DNS Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderDNS(domain, recs))
+}
+
+func (r *Router) handleNetIO(chatID int64) {
+	stats, err := nettools.GetNetworkIO()
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Net I/O Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderNetworkIO(stats))
+}
+
+func (r *Router) handleDocker(ctx context.Context, chatID int64, args string) {
+	parts := strings.Fields(args)
+	subcmd := "ps"
+	if len(parts) > 0 {
+		subcmd = strings.ToLower(parts[0])
+	}
+
+	switch subcmd {
+	case "ps":
+		containers, err := docker.ListContainers(ctx, true)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Docker PS Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		r.replyHTMLWithBack(chatID, r.renderer.RenderContainers(containers))
+
+	case "stats":
+		stats, err := docker.GetContainerStats(ctx)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Docker Stats Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		r.replyHTMLWithBack(chatID, r.renderer.RenderContainerStats(stats))
+
+	case "logs":
+		if len(parts) < 2 {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/docker logs &lt;container_id&gt; [lines]</code>")
+			return
+		}
+		cid := parts[1]
+		tail := 50
+		if len(parts) > 2 {
+			if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+				tail = n
+			}
+		}
+		logs, err := docker.GetContainerLogs(ctx, cid, tail)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Docker Logs Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		if logs == "" {
+			logs = "(no log output available)"
+		}
+		text := fmt.Sprintf("<b>🐳 DOCKER LOGS:</b> <code>%s</code>\n<pre><code>%s</code></pre>", html.EscapeString(cid), html.EscapeString(logs))
+		if len(text) > 4000 {
+			r.replyChunks(chatID, text)
+		} else {
+			r.replyHTMLWithBack(chatID, text)
+		}
+
+	case "restart":
+		if len(parts) < 2 {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/docker restart &lt;container_id&gt;</code>")
+			return
+		}
+		cid := parts[1]
+		if err := docker.RestartContainer(ctx, cid); err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Docker Restart Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Container Restarted:</b> <code>%s</code>", html.EscapeString(cid)))
+
+	default:
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/docker [ps|logs|restart|stats]</code>")
+	}
+}
+
+func (r *Router) handleCron(ctx context.Context, chatID int64, args string) {
+	if r.scheduler == nil {
+		r.replyHTML(chatID, "<b>⚠️ Scheduler Error:</b> Scheduler service is not initialized.")
+		return
+	}
+
+	parts := strings.Fields(args)
+	subcmd := "list"
+	if len(parts) > 0 {
+		subcmd = strings.ToLower(parts[0])
+	}
+
+	switch subcmd {
+	case "list":
+		jobs := r.scheduler.ListJobs()
+		r.replyHTMLWithBack(chatID, r.renderer.RenderCronJobs(jobs))
+
+	case "add":
+		if len(parts) < 3 {
+			r.replyHTML(chatID, "<b>Usage:</b>\n• <code>/cron add @every &lt;interval&gt; &lt;cmd&gt;</code>\n• <code>/cron add &lt;m&gt; &lt;h&gt; &lt;dom&gt; &lt;mon&gt; &lt;dow&gt; &lt;cmd&gt;</code>\nExample: <code>/cron add @every 1h /status</code>")
+			return
+		}
+		var spec string
+		var cmdStr string
+		if strings.HasPrefix(parts[1], "@every") {
+			if len(parts) < 4 {
+				r.replyHTML(chatID, "<b>Usage:</b> <code>/cron add @every &lt;interval&gt; &lt;cmd&gt;</code>\nExample: <code>/cron add @every 30m /status</code>")
+				return
+			}
+			spec = parts[1] + " " + parts[2]
+			cmdStr = strings.Join(parts[3:], " ")
+		} else if strings.HasPrefix(parts[1], "@") {
+			spec = parts[1]
+			cmdStr = strings.Join(parts[2:], " ")
+		} else {
+			if len(parts) < 7 {
+				r.replyHTML(chatID, "<b>Usage:</b> <code>/cron add &lt;m&gt; &lt;h&gt; &lt;dom&gt; &lt;mon&gt; &lt;dow&gt; &lt;cmd&gt;</code>")
+				return
+			}
+			spec = strings.Join(parts[1:6], " ")
+			cmdStr = strings.Join(parts[6:], " ")
+		}
+
+		job, err := r.scheduler.AddJob(spec, cmdStr, chatID)
+		if err != nil {
+			r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Cron Add Error:</b> %s", html.EscapeString(err.Error())))
+			return
+		}
+		_ = r.scheduler.Save()
+		r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Cron Job Scheduled:</b>\n• ID: <code>%s</code>\n• Spec: <code>%s</code>\n• Command: <code>%s</code>\n• Next Run: <code>%s</code>",
+			job.ID, html.EscapeString(job.Spec), html.EscapeString(job.Command), job.NextRun.Format("2006-01-02 15:04:05")))
+
+	case "remove", "rm", "delete":
+		if len(parts) < 2 {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/cron remove &lt;job_id&gt;</code>")
+			return
+		}
+		r.handleCronRemove(chatID, parts[1])
+
+	case "run":
+		if len(parts) < 2 {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/cron run &lt;job_id&gt;</code>")
+			return
+		}
+		r.handleCronRun(ctx, chatID, parts[1])
+
+	default:
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/cron [list|add|remove|run]</code>")
+	}
+}
+
+func (r *Router) handleCronRun(ctx context.Context, chatID int64, jobID string) {
+	if r.scheduler == nil {
+		r.replyHTML(chatID, "<b>⚠️ Scheduler Error:</b> Scheduler service is not initialized.")
+		return
+	}
+	if err := r.scheduler.RunJobNow(jobID); err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Cron Run Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+	r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Cron Job Executed:</b> <code>%s</code>", html.EscapeString(jobID)))
+}
+
+func (r *Router) handleCronRemove(chatID int64, jobID string) {
+	if r.scheduler == nil {
+		r.replyHTML(chatID, "<b>⚠️ Scheduler Error:</b> Scheduler service is not initialized.")
+		return
+	}
+	if !r.scheduler.RemoveJob(jobID) {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Cron Remove Error:</b> Job <code>%s</code> not found.", html.EscapeString(jobID)))
+		return
+	}
+	_ = r.scheduler.Save()
+	r.replyHTML(chatID, fmt.Sprintf("<b>🟢 Cron Job Removed:</b> <code>%s</code>", html.EscapeString(jobID)))
+}
+
+func (r *Router) handleAlerts(chatID int64) {
+	var alerts []watchdog.AlertEvent
+	if r.watchdog != nil {
+		alerts = r.watchdog.GetRecentAlerts()
+		if len(alerts) == 0 {
+			alerts = r.watchdog.CheckNow()
+		}
+	}
+	r.replyHTMLWithBack(chatID, r.renderer.RenderAlerts(alerts))
+}
+
+func (r *Router) handleBackup(chatID int64, sess *session.Session, args string) {
+	targetDir := strings.TrimSpace(args)
+	if targetDir == "" {
+		if sess != nil && sess.ActiveWorkingDir != "" {
+			targetDir = sess.ActiveWorkingDir
+		} else {
+			targetDir = "/opt/data/home/AgyRemoteTele"
+		}
+	}
+
+	backupDir := "/opt/data/home/AgyRemoteTele/data/backups"
+	_ = os.MkdirAll(backupDir, 0755)
+	destArchive := filepath.Join(backupDir, fmt.Sprintf("backup_%s.tar.gz", time.Now().Format("20060102_150405")))
+
+	excludes := []string{
+		"*.log",
+		".git",
+		"node_modules",
+		".cache",
+		"tmp",
+		"data/backups",
+	}
+
+	res, err := backup.CreateTarGz([]string{targetDir}, destArchive, excludes)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Backup Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+
+	summary := r.renderer.RenderBackup(res)
+	r.replyHTML(chatID, summary)
+
+	if res.TotalSizeBytes < 50*1024*1024 && r.api != nil {
+		doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(res.ArchivePath))
+		doc.Caption = fmt.Sprintf("📦 Backup archive (%s, %d files)", filepath.Base(targetDir), res.FileCount)
+		sent, err := r.api.Send(doc)
+		if err == nil && r.sessionStore != nil {
+			r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+		}
+	}
+}
+
+func (r *Router) handleSwarm(ctx context.Context, chatID int64, sess *session.Session, args string) {
+	prompt := strings.TrimSpace(args)
+	if prompt == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/swarm &lt;prompt&gt;</code>\nExample: <code>/swarm git status check</code>")
+		return
+	}
+
+	if r.swarmManager == nil {
+		r.swarmManager = cluster.NewSwarmManager("", "")
+	}
+
+	workDir := ""
+	if sess != nil {
+		workDir = sess.ActiveWorkingDir
+	}
+
+	r.replyHTML(chatID, fmt.Sprintf("<b>🐝 SWARM BROADCAST DISPATCHED</b>\n\nPrompt: <i>%s</i>\nBroadcasting to workers...", html.EscapeString(prompt)))
+
+	results, err := r.swarmManager.BroadcastPrompt(ctx, nil, prompt, workDir)
+	if err != nil {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Swarm Broadcast Error:</b> %s", html.EscapeString(err.Error())))
+		return
+	}
+
+	r.replyHTMLWithBack(chatID, r.renderer.RenderSwarm(results))
 }

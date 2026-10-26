@@ -8,11 +8,17 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/dresar/AgyRemoteTele/internal/agy"
 	"github.com/dresar/AgyRemoteTele/internal/bot"
+	"github.com/dresar/AgyRemoteTele/internal/cluster"
 	"github.com/dresar/AgyRemoteTele/internal/config"
+	"github.com/dresar/AgyRemoteTele/internal/scheduler"
 	"github.com/dresar/AgyRemoteTele/internal/session"
+	"github.com/dresar/AgyRemoteTele/internal/watchdog"
 )
 
 func main() {
@@ -62,13 +68,51 @@ func main() {
 		cfg.ExecutionTimeout,
 	)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	schedStore := filepath.Join(filepath.Dir(cfg.SessionFilePath), "cron_jobs.json")
+	sched := scheduler.NewScheduler(schedStore, func(chatID int64, cmd string) {
+		up := tgbotapi.Update{
+			Message: &tgbotapi.Message{
+				Chat: &tgbotapi.Chat{ID: chatID},
+				From: &tgbotapi.User{UserName: "scheduler"},
+				Text: cmd,
+			},
+		}
+		router.HandleUpdate(ctx, up)
+	})
+
+	wdCfg := watchdog.AlertConfig{
+		CheckInterval:       60 * time.Second,
+		HighMemThreshold:    85.0,
+		CritMemThreshold:    92.0,
+		HighDiskThreshold:   90.0,
+		TokenWarningMinutes: 30,
+	}
+
+	var botInstance *bot.Bot
+	wd := watchdog.NewWatchdog(wdCfg, func(level, title, message string) {
+		if botInstance != nil {
+			botInstance.BroadcastAlert(level, title, message)
+		}
+	})
+
+	swarmMgr := cluster.NewSwarmManager(cfg.ProfilesRoot, "/opt/data/home/agy-profiles/orchestrator.py")
+
+	router.SetScheduler(sched)
+	router.SetWatchdog(wd)
+	router.SetSwarmManager(swarmMgr)
+
 	b, err := bot.NewBot(cfg.TelegramBotToken, router, sessionStore)
 	if err != nil {
 		log.Fatalf("failed to create telegram bot instance: %v", err)
 	}
+	b.SetAdminChatIDs(cfg.AllowedChatIDs)
+	botInstance = b
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	sched.Start(ctx)
+	wd.Start(ctx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -78,9 +122,14 @@ func main() {
 		log.Printf("received signal %s, initiating graceful shutdown...", sig)
 		cancel()
 		b.Stop()
+		wd.Stop()
+		sched.Stop()
 	}()
 
 	if err := b.Start(ctx); err != nil {
 		log.Fatalf("bot runner exited with error: %v", err)
 	}
+
+	wd.Stop()
+	sched.Stop()
 }

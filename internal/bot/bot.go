@@ -2,7 +2,10 @@ package bot
 
 import (
 	"context"
+	"fmt"
+	"html"
 	"log"
+	"strings"
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -14,6 +17,7 @@ type Bot struct {
 	api          *tgbotapi.BotAPI
 	router       *Router
 	sessionStore *session.Store
+	adminChatIDs []int64
 	stopChan     chan struct{}
 	stopOnce     sync.Once
 	wg           sync.WaitGroup
@@ -33,6 +37,37 @@ func NewBot(token string, router *Router, sessionStore *session.Store) (*Bot, er
 		sessionStore: sessionStore,
 		stopChan:     make(chan struct{}),
 	}, nil
+}
+
+func (b *Bot) SetAdminChatIDs(ids []int64) {
+	b.adminChatIDs = ids
+}
+
+func (b *Bot) BroadcastAlert(level, title, message string) {
+	if b.api == nil || len(b.adminChatIDs) == 0 {
+		return
+	}
+
+	icon := "🚨"
+	switch strings.ToUpper(level) {
+	case "CRITICAL":
+		icon = "🔴"
+	case "WARNING":
+		icon = "🟡"
+	case "INFO":
+		icon = "ℹ️"
+	case "RESOLVED":
+		icon = "🟢"
+	}
+
+	text := fmt.Sprintf("<b>%s WATCHDOG ALERT — %s</b>\n\n<b>Level:</b> <code>%s</code>\n<b>Message:</b> %s",
+		icon, html.EscapeString(title), html.EscapeString(level), html.EscapeString(message))
+
+	for _, chatID := range b.adminChatIDs {
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = tgbotapi.ModeHTML
+		_, _ = b.api.Send(msg)
+	}
 }
 
 func (b *Bot) Start(ctx context.Context) error {
@@ -70,6 +105,19 @@ func (b *Bot) registerCommands() {
 		{Command: "start", Description: "Pusat kontrol interaktif AgyRemoteTele"},
 		{Command: "help", Description: "Panduan bantuan penggunaan bot"},
 		{Command: "status", Description: "Live telemetry VPS: CPU, RAM, Disk"},
+		{Command: "ps", Description: "Daftar proses aktif sistem (top processes)"},
+		{Command: "kill", Description: "Hentikan proses dengan PID: /kill <pid> [sig]"},
+		{Command: "ports", Description: "Daftar port listening dan network sockets"},
+		{Command: "service", Description: "Kelola status dan restart service sistem"},
+		{Command: "ping", Description: "Uji konektivitas ICMP: /ping <host>"},
+		{Command: "curl", Description: "Uji endpoint HTTP/HTTPS: /curl <url>"},
+		{Command: "dns", Description: "Query DNS record domain: /dns <domain> [type]"},
+		{Command: "netio", Description: "Statistik traffic interface jaringan (Net I/O)"},
+		{Command: "docker", Description: "Kelola container Docker (ps, logs, stats, restart)"},
+		{Command: "cron", Description: "Kelola tugas terjadwal / cron jobs"},
+		{Command: "alerts", Description: "Lihat riwayat alert watchdog sistem"},
+		{Command: "backup", Description: "Buat arsip backup tar.gz direktori"},
+		{Command: "swarm", Description: "Broadcast prompt ke seluruh worker cluster"},
 		{Command: "accounts", Description: "Status worker accounts dan token"},
 		{Command: "refresh", Description: "Refresh token worker account"},
 		{Command: "workers", Description: "Status daemon worker agy01-agy10"},
