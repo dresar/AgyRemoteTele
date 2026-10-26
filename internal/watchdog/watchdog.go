@@ -22,6 +22,7 @@ var profileRegex = regexp.MustCompile(`^agy(0[1-9]|1[0-5])$`)
 
 type AlertConfig struct {
 	CheckInterval       time.Duration
+	TokenCheckInterval  time.Duration
 	HighMemThreshold    float64
 	CritMemThreshold    float64
 	HighDiskThreshold   float64
@@ -51,6 +52,7 @@ type Watchdog struct {
 	running         bool
 	wg              sync.WaitGroup
 	AutoRefreshFunc func(name string) error
+	lastTokenCheck  time.Time
 }
 
 func defaultAutoRefresh(name string) error {
@@ -63,6 +65,9 @@ func defaultAutoRefresh(name string) error {
 func NewWatchdog(cfg AlertConfig, notifyFunc func(level string, title string, message string)) *Watchdog {
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = 30 * time.Second
+	}
+	if cfg.TokenCheckInterval <= 0 {
+		cfg.TokenCheckInterval = 24 * time.Hour
 	}
 	if cfg.HighMemThreshold <= 0 {
 		cfg.HighMemThreshold = 85.0
@@ -118,6 +123,12 @@ func (w *Watchdog) SetAutoRefreshFunc(fn func(name string) error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.AutoRefreshFunc = fn
+}
+
+func (w *Watchdog) SetTokenCheckInterval(d time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cfg.TokenCheckInterval = d
 }
 
 func (w *Watchdog) Start(ctx context.Context) {
@@ -180,8 +191,18 @@ func (w *Watchdog) CheckNow() []AlertEvent {
 	diskAlerts := w.checkDisk()
 	currentAlerts = append(currentAlerts, diskAlerts...)
 
-	tokenAlerts := w.checkTokens()
-	currentAlerts = append(currentAlerts, tokenAlerts...)
+	var shouldCheckTokens bool
+	w.mu.Lock()
+	if w.lastTokenCheck.IsZero() || time.Since(w.lastTokenCheck) >= w.cfg.TokenCheckInterval {
+		w.lastTokenCheck = time.Now()
+		shouldCheckTokens = true
+	}
+	w.mu.Unlock()
+
+	if shouldCheckTokens {
+		tokenAlerts := w.checkTokens()
+		currentAlerts = append(currentAlerts, tokenAlerts...)
+	}
 
 	for _, alert := range currentAlerts {
 		dedupKey := fmt.Sprintf("%s:%s", alert.Metric, alert.Level)
@@ -189,6 +210,20 @@ func (w *Watchdog) CheckNow() []AlertEvent {
 	}
 
 	return currentAlerts
+}
+
+func (w *Watchdog) ForceCheckTokens() []AlertEvent {
+	w.mu.Lock()
+	w.lastTokenCheck = time.Now()
+	w.mu.Unlock()
+
+	tokenAlerts := w.checkTokens()
+	for _, alert := range tokenAlerts {
+		dedupKey := fmt.Sprintf("%s:%s", alert.Metric, alert.Level)
+		w.processAlert(alert, dedupKey)
+	}
+
+	return tokenAlerts
 }
 
 func (w *Watchdog) checkMemory() []AlertEvent {

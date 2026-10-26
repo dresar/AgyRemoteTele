@@ -365,3 +365,95 @@ func TestWatchdogGetRecentAlerts(t *testing.T) {
 		t.Errorf("expected RAM alert, got %s", recent[0].Metric)
 	}
 }
+
+func TestWatchdogDefaultTokenCheckInterval(t *testing.T) {
+	cfg := AlertConfig{}
+	w := NewWatchdog(cfg, nil)
+	if w.cfg.TokenCheckInterval != 24*time.Hour {
+		t.Fatalf("expected default TokenCheckInterval 24h, got %v", w.cfg.TokenCheckInterval)
+	}
+}
+
+func TestWatchdogTokenCheckDailyInterval(t *testing.T) {
+	tmpDir := t.TempDir()
+	createMockToken(t, tmpDir, "agy02", time.Now().Add(5*time.Minute))
+
+	var refreshCount atomic.Int32
+	cfg := AlertConfig{
+		TokenCheckInterval:  24 * time.Hour,
+		TokenWarningMinutes: 15,
+		HighMemThreshold:    99.9,
+		CritMemThreshold:    99.9,
+		HighDiskThreshold:   99.9,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+	w.SetDiskPath(tmpDir)
+	memPath := createMockMeminfo(t, tmpDir, 10000, 9000)
+	w.SetMeminfoPath(memPath)
+
+	w.AutoRefreshFunc = func(name string) error {
+		refreshCount.Add(1)
+		return nil
+	}
+
+	w.CheckNow()
+	if refreshCount.Load() != 1 {
+		t.Fatalf("expected refreshCount 1 on initial CheckNow, got %d", refreshCount.Load())
+	}
+
+	for i := 0; i < 5; i++ {
+		w.CheckNow()
+	}
+	if refreshCount.Load() != 1 {
+		t.Fatalf("expected refreshCount still 1 after rapid CheckNow calls, got %d", refreshCount.Load())
+	}
+
+	w.mu.Lock()
+	w.lastTokenCheck = time.Now().Add(-25 * time.Hour)
+	w.mu.Unlock()
+
+	w.CheckNow()
+	if refreshCount.Load() != 2 {
+		t.Fatalf("expected refreshCount 2 after interval elapsed, got %d", refreshCount.Load())
+	}
+}
+
+func TestWatchdogForceCheckTokens(t *testing.T) {
+	tmpDir := t.TempDir()
+	createMockToken(t, tmpDir, "agy02", time.Now().Add(5*time.Minute))
+
+	var refreshCount atomic.Int32
+	cfg := AlertConfig{
+		TokenCheckInterval:  24 * time.Hour,
+		TokenWarningMinutes: 15,
+		HighMemThreshold:    99.9,
+		CritMemThreshold:    99.9,
+		HighDiskThreshold:   99.9,
+	}
+	w := NewWatchdog(cfg, nil)
+	w.SetProfilesRoot(tmpDir)
+	w.SetDiskPath(tmpDir)
+	memPath := createMockMeminfo(t, tmpDir, 10000, 9000)
+	w.SetMeminfoPath(memPath)
+
+	w.AutoRefreshFunc = func(name string) error {
+		refreshCount.Add(1)
+		return nil
+	}
+
+	w.CheckNow()
+	if refreshCount.Load() != 1 {
+		t.Fatalf("expected refreshCount 1 after initial CheckNow, got %d", refreshCount.Load())
+	}
+
+	w.CheckNow()
+	if refreshCount.Load() != 1 {
+		t.Fatalf("expected refreshCount still 1, got %d", refreshCount.Load())
+	}
+
+	w.ForceCheckTokens()
+	if refreshCount.Load() != 2 {
+		t.Fatalf("expected refreshCount 2 after ForceCheckTokens, got %d", refreshCount.Load())
+	}
+}

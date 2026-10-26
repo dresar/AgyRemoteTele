@@ -85,6 +85,7 @@ func main() {
 
 	wdCfg := watchdog.AlertConfig{
 		CheckInterval:       60 * time.Second,
+		TokenCheckInterval:  24 * time.Hour,
 		HighMemThreshold:    85.0,
 		CritMemThreshold:    92.0,
 		HighDiskThreshold:   90.0,
