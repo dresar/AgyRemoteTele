@@ -68,7 +68,14 @@ func (b *Bot) Start(ctx context.Context) error {
 func (b *Bot) registerCommands() {
 	commands := []tgbotapi.BotCommand{
 		{Command: "start", Description: "Pusat kontrol interaktif AgyRemoteTele"},
+		{Command: "help", Description: "Panduan bantuan penggunaan bot"},
 		{Command: "status", Description: "Live telemetry VPS: CPU, RAM, Disk"},
+		{Command: "accounts", Description: "Status worker accounts dan token"},
+		{Command: "refresh", Description: "Refresh token worker account"},
+		{Command: "workers", Description: "Status daemon worker agy01-agy10"},
+		{Command: "tasks", Description: "Daftar task aktif dan riwayat worker"},
+		{Command: "usage", Description: "Monitor penggunaan token dan resource cluster"},
+		{Command: "send", Description: "Kirim prompt ke worker secara asynchronous"},
 		{Command: "ask", Description: "Kirim instruksi prompt ke agent AGY"},
 		{Command: "profile", Description: "Ganti profil worker (agy01 - agy15)"},
 		{Command: "history", Description: "Lihat transcript sesi percakapan"},
@@ -80,11 +87,21 @@ func (b *Bot) registerCommands() {
 		{Command: "get", Description: "Download file dari VPS sebagai dokumen"},
 		{Command: "sh", Description: "Jalankan perintah bash terminal"},
 		{Command: "git", Description: "Cek git status, diff, dan sync"},
-		{Command: "help", Description: "Panduan bantuan penggunaan bot"},
+	}
+
+	if b.api == nil {
+		return
 	}
 
 	cfg := tgbotapi.NewSetMyCommands(commands...)
-	_, _ = b.api.Request(cfg)
+	if _, err := b.api.Request(cfg); err != nil {
+		log.Printf("failed to register default bot commands: %v", err)
+	}
+
+	scopeCfg := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeAllPrivateChats(), commands...)
+	if _, err := b.api.Request(scopeCfg); err != nil {
+		log.Printf("failed to register all_private_chats bot commands: %v", err)
+	}
 }
 
 func (b *Bot) Stop() {

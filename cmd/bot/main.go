@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/dresar/AgyRemoteTele/internal/agy"
@@ -14,6 +16,23 @@ import (
 )
 
 func main() {
+	lockPath := "/opt/data/home/AgyRemoteTele/data/agyremote.lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		log.Fatalf("failed to create lock directory: %v", err)
+	}
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		log.Fatalf("failed to open lock file: %v", err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		fmt.Fprintf(os.Stderr, "another instance of agyremote is already running: lock held on %s (%v)\n", lockPath, err)
+		os.Exit(1)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("configuration initialization failed: %v", err)

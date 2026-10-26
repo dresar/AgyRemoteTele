@@ -2,11 +2,13 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -109,17 +111,42 @@ func (r *Router) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 	case "help":
 		r.handleHelp(chatID)
 	case "login":
-		r.handleLogin(chatID, text)
+		if args != "" && (r.authManager.ValidateAdminKey(args) || r.authManager.ConsumePairingToken(args)) {
+			r.sessionStore.Authenticate(chatID)
+			r.replyHTML(chatID, "<b>🟢 AUTHENTICATION SUCCESSFUL</b>\n\nDevice paired successfully. You now have full access to the control plane.")
+		} else if args != "" {
+			r.handleLoginAccount(ctx, chatID, args)
+		} else {
+			r.replyHTML(chatID, "<b>Usage:</b> <code>/login &lt;account&gt;</code>\nExample: <code>/login agy01</code>")
+		}
 	case "logout":
-		r.handleLogout(chatID)
+		if args != "" {
+			r.handleLogoutAccount(ctx, chatID, args)
+		} else {
+			r.handleLogout(chatID)
+		}
+	case "switch":
+		r.handleSwitch(chatID, sess, args)
+	case "send":
+		r.handleSend(ctx, chatID, args)
+	case "tasks":
+		r.handleTasks(ctx, chatID)
+	case "workers":
+		r.handleWorkers(ctx, chatID)
+	case "usage":
+		r.handleUsage(ctx, chatID)
+	case "accounts":
+		r.handleAccounts(ctx, chatID)
+	case "refresh":
+		if args != "" {
+			r.handleRefreshAccount(ctx, chatID, args)
+		} else {
+			r.handleRefresh(ctx, chatID)
+		}
 	case "ask":
 		r.handleAsk(ctx, chatID, sess, args)
 	case "profile":
 		r.handleProfile(chatID, sess, args)
-	case "accounts", "workers":
-		r.handleAccounts(ctx, chatID)
-	case "refresh":
-		r.handleRefresh(ctx, chatID)
 	case "history":
 		r.handleHistory(chatID, sess)
 	case "resume":
@@ -171,11 +198,18 @@ func (r *Router) getStartMenuMarkup() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "nav:refresh"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📜 History", "nav:history"),
-			tgbotapi.NewInlineKeyboardButtonData("📁 Workspace", "nav:ls"),
+			tgbotapi.NewInlineKeyboardButtonData("🤖 Workers", "nav:workers"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Usage", "nav:usage"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 Tasks", "nav:tasks"),
+			tgbotapi.NewInlineKeyboardButtonData("📜 History", "nav:history"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📁 Workspace", "nav:ls"),
 			tgbotapi.NewInlineKeyboardButtonData("🌿 Git", "nav:git"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("❓ Help", "nav:help"),
 		),
 	)
@@ -641,7 +675,26 @@ func (r *Router) handleAccounts(ctx context.Context, chatID int64) {
 		b.WriteString(fmt.Sprintf("  └ 📧 <code>%s</code>\n\n", html.EscapeString(acc.email)))
 	}
 
-	r.replyHTMLWithBack(chatID, strings.TrimRight(b.String(), "\n"))
+	var rows [][]tgbotapi.InlineKeyboardButton
+	var currentRow []tgbotapi.InlineKeyboardButton
+	for _, acc := range accounts {
+		btn := tgbotapi.NewInlineKeyboardButtonData("🔄 "+acc.name, "refresh_acc:"+acc.name)
+		currentRow = append(currentRow, btn)
+		if len(currentRow) == 5 {
+			rows = append(rows, currentRow)
+			currentRow = nil
+		}
+	}
+	if len(currentRow) > 0 {
+		rows = append(rows, currentRow)
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh Semua", "nav:refresh"),
+		tgbotapi.NewInlineKeyboardButtonData("« Menu Utama", "nav:start"),
+	))
+	markup := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	r.replyHTMLWithMarkup(chatID, strings.TrimRight(b.String(), "\n"), markup)
 }
 
 func (r *Router) handleRefresh(ctx context.Context, chatID int64) {
@@ -749,6 +802,12 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 		return
 	}
 
+	if strings.HasPrefix(data, "refresh_acc:") {
+		target := strings.TrimPrefix(data, "refresh_acc:")
+		r.handleRefreshAccount(ctx, chatID, target)
+		return
+	}
+
 	switch data {
 	case "nav:status":
 		metrics, err := system.CollectMetrics(sess.ActiveWorkingDir)
@@ -766,6 +825,15 @@ func (r *Router) handleCallbackQuery(ctx context.Context, cb *tgbotapi.CallbackQ
 
 	case "nav:refresh":
 		r.handleRefresh(ctx, chatID)
+
+	case "nav:workers":
+		r.handleWorkers(ctx, chatID)
+
+	case "nav:tasks":
+		r.handleTasks(ctx, chatID)
+
+	case "nav:usage":
+		r.handleUsage(ctx, chatID)
 
 	case "nav:profile":
 		profiles, _ := r.profileManager.ListProfiles()
@@ -879,4 +947,535 @@ func truncateString(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+func (r *Router) replyHTMLWithMarkup(chatID int64, text string, markup tgbotapi.InlineKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = markup
+	sent, err := r.api.Send(msg)
+	if err == nil {
+		r.sessionStore.SetLastBotMessageIDs(chatID, []int{sent.MessageID})
+	}
+}
+
+func normalizeAccount(acc string) string {
+	clean := strings.ToLower(strings.TrimSpace(acc))
+	if clean == "" {
+		return ""
+	}
+	if strings.HasPrefix(clean, "agy") && len(clean) == 5 {
+		return clean
+	}
+	var digits strings.Builder
+	for _, r := range clean {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	if digits.Len() > 0 {
+		var num int
+		if _, err := fmt.Sscanf(digits.String(), "%d", &num); err == nil && num >= 1 && num <= 15 {
+			return fmt.Sprintf("agy%02d", num)
+		}
+	}
+	return clean
+}
+
+func (r *Router) handleLoginAccount(ctx context.Context, chatID int64, account string) {
+	cleanAcc := normalizeAccount(account)
+	if cleanAcc == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/login &lt;account&gt;</code>\nExample: <code>/login agy01</code>")
+		return
+	}
+
+	r.sendTyping(chatID)
+	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "login", cleanAcc)
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Login Error (%s):</b>\n<pre><code>%s</code></pre>", html.EscapeString(cleanAcc), html.EscapeString(err.Error())))
+		return
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("<b>🔑 AGY ACCOUNT LOGIN — %s</b>\n\n", strings.ToUpper(cleanAcc)))
+
+	var authURL string
+	for _, line := range strings.Split(outStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "https://accounts.google.com/o/oauth2/auth") {
+			parts := strings.Fields(trimmed)
+			if len(parts) > 0 {
+				authURL = parts[0]
+			}
+			break
+		}
+	}
+
+	if authURL != "" {
+		b.WriteString(fmt.Sprintf("🔗 <a href=\"%s\"><b>Klik di Sini untuk Otorisasi Google</b></a>\n\n", authURL))
+		b.WriteString(fmt.Sprintf("<b>URL Otorisasi:</b>\n<code>%s</code>\n\n", html.EscapeString(authURL)))
+		b.WriteString(fmt.Sprintf("Setelah menyalin kode dari browser, jalankan di terminal:\n<code>python3 /opt/data/home/agy-profiles/fast_login.py code %s &quot;&lt;KODE_OTORISASI&gt;&quot;</code>", html.EscapeString(cleanAcc)))
+	} else {
+		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(outStr)))
+	}
+
+	r.replyHTMLWithBack(chatID, b.String())
+}
+
+func (r *Router) handleLogoutAccount(ctx context.Context, chatID int64, account string) {
+	cleanAcc := normalizeAccount(account)
+	if cleanAcc == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/logout &lt;account&gt;</code>\nExample: <code>/logout agy01</code>")
+		return
+	}
+
+	r.sendTyping(chatID)
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "logout", cleanAcc)
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Logout Error (%s):</b>\n<pre><code>%s</code></pre>", html.EscapeString(cleanAcc), html.EscapeString(err.Error())))
+		return
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("<b>🔒 AGY ACCOUNT LOGOUT — %s</b>\n\n", strings.ToUpper(cleanAcc)))
+	b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(outStr)))
+
+	r.replyHTMLWithBack(chatID, b.String())
+}
+
+func (r *Router) handleSwitch(chatID int64, sess *session.Session, targetProfile string) {
+	clean := normalizeAccount(targetProfile)
+	if clean == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/switch &lt;account&gt;</code>\nExample: <code>/switch agy02</code>")
+		return
+	}
+
+	if !r.profileManager.ValidateProfile(clean) {
+		r.replyHTML(chatID, fmt.Sprintf("<b>🔴 Error:</b> Profile <code>%s</code> is not valid or directory not found.", html.EscapeString(clean)))
+		return
+	}
+
+	oldProfile := sess.ActiveProfile
+	r.sessionStore.SetProfile(chatID, clean)
+	r.replyHTMLWithBack(chatID, r.renderer.RenderProfileSwitched(oldProfile, clean))
+}
+
+func (r *Router) handleRefreshAccount(ctx context.Context, chatID int64, account string) {
+	r.sendTyping(chatID)
+
+	cleanAcc := normalizeAccount(account)
+	execCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "refresh", cleanAcc)
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Refresh Error (%s):</b>\n<pre><code>%s</code></pre>", html.EscapeString(cleanAcc), html.EscapeString(err.Error())))
+		return
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("<b>🔄 TOKEN REFRESH — %s</b>\n\n", strings.ToUpper(cleanAcc)))
+	b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(outStr)))
+
+	r.replyHTMLWithBack(chatID, b.String())
+}
+
+func (r *Router) handleSend(ctx context.Context, chatID int64, args string) {
+	parts := strings.SplitN(strings.TrimSpace(args), " ", 2)
+	if len(parts) < 2 || parts[0] == "" || strings.TrimSpace(parts[1]) == "" {
+		r.replyHTML(chatID, "<b>Usage:</b> <code>/send &lt;account&gt; &lt;prompt&gt;</code>\nExample: <code>/send agy02 Cek status git</code>")
+		return
+	}
+
+	targetAcc := normalizeAccount(parts[0])
+	promptText := strings.TrimSpace(parts[1])
+
+	r.sendTyping(chatID)
+
+	dispatchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(dispatchCtx, "python3", "/opt/data/home/agy-profiles/orchestrator.py", "dispatch", targetAcc, promptText, "--workspace", "/opt/data/home/AgyRemoteTele")
+	out, err := cmd.CombinedOutput()
+	outStr := string(out)
+
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Dispatch Failed:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	var taskID string
+	for _, line := range strings.Split(outStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "Task ID") {
+			subParts := strings.Split(trimmed, ":")
+			if len(subParts) >= 2 {
+				taskID = strings.TrimSpace(subParts[1])
+				break
+			}
+		}
+	}
+
+	if taskID == "" {
+		re := regexp.MustCompile(`(agy\d+_\d+)`)
+		m := re.FindStringSubmatch(outStr)
+		if len(m) > 1 {
+			taskID = m[1]
+		}
+	}
+
+	if taskID == "" {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Task Dispatch Output:</b>\n<pre><code>%s</code></pre>", html.EscapeString(outStr)))
+		return
+	}
+
+	dispatchMsg := fmt.Sprintf("🚀 <b>task dispatched %s</b>\n\n• <b>Worker:</b> <code>%s</code>\n• <b>Workspace:</b> <code>/opt/data/home/AgyRemoteTele</code>\n• <b>Prompt:</b> <i>%s</i>\n\n<i>Monitoring execution in background (max 30m)...</i>",
+		html.EscapeString(taskID), html.EscapeString(targetAcc), html.EscapeString(truncateString(promptText, 80)))
+	r.replyHTML(chatID, dispatchMsg)
+
+	go r.monitorTask(chatID, taskID, targetAcc)
+}
+
+func (r *Router) monitorTask(chatID int64, taskID string, targetAcc string) {
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(8 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			r.replyHTML(chatID, fmt.Sprintf("<b>⏱ TASK TIMEOUT (30m)</b>\n\nTask <code>%s</code> on worker <code>%s</code> reached maximum execution duration.", html.EscapeString(taskID), html.EscapeString(targetAcc)))
+			return
+		case <-ticker.C:
+			checkCtx, checkCancel := context.WithTimeout(timeoutCtx, 15*time.Second)
+			cmd := exec.CommandContext(checkCtx, "python3", "/opt/data/home/agy-profiles/orchestrator.py", "status", "--task-id", taskID)
+			out, err := cmd.CombinedOutput()
+			checkCancel()
+
+			if err != nil && len(out) == 0 {
+				continue
+			}
+
+			outStr := string(out)
+			var status string
+			for _, line := range strings.Split(outStr, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "Status") {
+					subParts := strings.Split(trimmed, ":")
+					if len(subParts) >= 2 {
+						status = strings.TrimSpace(subParts[1])
+						break
+					}
+				}
+			}
+
+			if status == "FINISHED" || status == "FAILED" {
+				var finalOutput strings.Builder
+				badge := "✅"
+				if status == "FAILED" {
+					badge = "❌"
+				}
+				finalOutput.WriteString(fmt.Sprintf("%s <b>TASK %s — %s</b>\n", badge, html.EscapeString(status), html.EscapeString(taskID)))
+				finalOutput.WriteString(fmt.Sprintf("• <b>Worker:</b> <code>%s</code>\n\n", html.EscapeString(targetAcc)))
+
+				logPath := fmt.Sprintf("/opt/data/home/agy-profiles/orchestrator_tasks/%s.log", taskID)
+				if logBytes, readErr := os.ReadFile(logPath); readErr == nil && len(logBytes) > 0 {
+					lines := strings.Split(string(logBytes), "\n")
+					start := 0
+					if len(lines) > 40 {
+						start = len(lines) - 40
+					}
+					snippet := strings.Join(lines[start:], "\n")
+					finalOutput.WriteString("<b>Output Terakhir:</b>\n<pre><code>")
+					finalOutput.WriteString(html.EscapeString(snippet))
+					finalOutput.WriteString("</code></pre>")
+				} else {
+					finalOutput.WriteString("<pre><code>")
+					finalOutput.WriteString(html.EscapeString(outStr))
+					finalOutput.WriteString("</code></pre>")
+				}
+
+				r.replyChunks(chatID, finalOutput.String())
+				return
+			}
+		}
+	}
+}
+
+func (r *Router) handleTasks(ctx context.Context, chatID int64) {
+	r.sendTyping(chatID)
+
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/orchestrator.py", "status")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Tasks Error:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	type taskEntry struct {
+		taskID string
+		worker string
+		status string
+		prompt string
+	}
+
+	var tasks []taskEntry
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, "|") {
+			continue
+		}
+		parts := strings.Split(trimmed, "|")
+		if len(parts) != 4 {
+			continue
+		}
+		tid := strings.TrimSpace(parts[0])
+		if strings.EqualFold(tid, "TASK ID") || strings.HasPrefix(tid, "-") || strings.HasPrefix(tid, "=") {
+			continue
+		}
+		tasks = append(tasks, taskEntry{
+			taskID: tid,
+			worker: strings.TrimSpace(parts[1]),
+			status: strings.TrimSpace(parts[2]),
+			prompt: strings.TrimSpace(parts[3]),
+		})
+	}
+
+	var b strings.Builder
+	b.WriteString("<b>📋 ORCHESTRATOR TASKS & WORKERS</b>\n\n")
+
+	if len(tasks) == 0 {
+		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(string(out))))
+	} else {
+		for _, t := range tasks {
+			badge := "⚪"
+			if t.status == "RUNNING" {
+				badge = "🟢"
+			} else if t.status == "FAILED" {
+				badge = "🔴"
+			}
+			b.WriteString(fmt.Sprintf("%s <b>%s</b> • <code>%s</code> (<b>%s</b>)\n", badge, html.EscapeString(t.worker), html.EscapeString(t.taskID), html.EscapeString(t.status)))
+			b.WriteString(fmt.Sprintf("  └ <i>%s</i>\n\n", html.EscapeString(truncateString(t.prompt, 50))))
+		}
+	}
+
+	r.replyHTMLWithBack(chatID, strings.TrimRight(b.String(), "\n"))
+}
+
+func (r *Router) handleWorkers(ctx context.Context, chatID int64) {
+	r.sendTyping(chatID)
+
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/orchestrator.py", "workers")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		r.replyHTMLWithBack(chatID, fmt.Sprintf("<b>🔴 Workers Error:</b>\n<pre><code>%s</code></pre>", html.EscapeString(err.Error())))
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	type workerInfo struct {
+		profile  string
+		remoteID string
+		auth     string
+		daemon   string
+		email    string
+	}
+
+	var workers []workerInfo
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, "|") {
+			continue
+		}
+		parts := strings.Split(trimmed, "|")
+		if len(parts) != 5 {
+			continue
+		}
+		p := strings.TrimSpace(parts[0])
+		if !strings.HasPrefix(strings.ToLower(p), "agy") {
+			continue
+		}
+		workers = append(workers, workerInfo{
+			profile:  p,
+			remoteID: strings.TrimSpace(parts[1]),
+			auth:     strings.TrimSpace(parts[2]),
+			daemon:   strings.TrimSpace(parts[3]),
+			email:    strings.TrimSpace(parts[4]),
+		})
+	}
+
+	var b strings.Builder
+	b.WriteString("<b>🤖 AGY WORKERS DAEMON STATUS (01 - 10)</b>\n\n")
+
+	if len(workers) == 0 {
+		b.WriteString(fmt.Sprintf("<pre><code>%s</code></pre>", html.EscapeString(string(out))))
+	} else {
+		for _, w := range workers {
+			badge := "⚪"
+			if strings.Contains(w.daemon, "PID") {
+				badge = "🟢"
+			}
+			b.WriteString(fmt.Sprintf("%s <b>%s</b> • <code>%s</code>\n", badge, html.EscapeString(w.profile), html.EscapeString(w.remoteID)))
+			b.WriteString(fmt.Sprintf("  ├ 🔐 Auth: %s\n", html.EscapeString(w.auth)))
+			b.WriteString(fmt.Sprintf("  ├ ⚙️ Daemon: %s\n", html.EscapeString(w.daemon)))
+			b.WriteString(fmt.Sprintf("  └ 📧 Email: <code>%s</code>\n\n", html.EscapeString(w.email)))
+		}
+	}
+
+	r.replyHTMLWithBack(chatID, strings.TrimRight(b.String(), "\n"))
+}
+
+func (r *Router) handleUsage(ctx context.Context, chatID int64) {
+	r.sendTyping(chatID)
+
+	type workerUsage struct {
+		Account        string
+		TokenRemaining string
+		ActiveSession  string
+		FinishedTasks  int
+	}
+
+	usageMap := make(map[string]*workerUsage)
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("agy%02d", i)
+		usageMap[name] = &workerUsage{
+			Account:        name,
+			TokenRemaining: "-",
+			ActiveSession:  "⚪ Mati",
+			FinishedTasks:  0,
+		}
+	}
+
+	tasksDBPath := "/opt/data/home/agy-profiles/orchestrator_tasks/tasks.json"
+	if data, err := os.ReadFile(tasksDBPath); err == nil {
+		type taskItem struct {
+			Account string `json:"account"`
+			Status  string `json:"status"`
+		}
+		var rawTasks map[string]taskItem
+		if err := json.Unmarshal(data, &rawTasks); err == nil {
+			for _, t := range rawTasks {
+				if t.Status == "FINISHED" {
+					normAcc := normalizeAccount(t.Account)
+					if u, ok := usageMap[normAcc]; ok {
+						u.FinishedTasks++
+					}
+				}
+			}
+		}
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmdStat := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/fast_login.py", "status")
+	if outStat, err := cmdStat.CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(outStat), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.Contains(trimmed, "|") {
+				continue
+			}
+			parts := strings.Split(trimmed, "|")
+			if len(parts) != 4 {
+				continue
+			}
+			accName := normalizeAccount(parts[0])
+			u, exists := usageMap[accName]
+			if !exists {
+				continue
+			}
+			status := strings.TrimSpace(parts[1])
+			remaining := strings.TrimSpace(parts[2])
+			if strings.EqualFold(status, "Aktif") {
+				remClean := strings.ReplaceAll(remaining, " menit ", "m ")
+				remClean = strings.ReplaceAll(remClean, " detik", "s")
+				u.TokenRemaining = remClean
+			} else if strings.EqualFold(status, "Belum Login") {
+				u.TokenRemaining = "No Login"
+			} else {
+				u.TokenRemaining = status
+			}
+		}
+	}
+
+	cmdWork := exec.CommandContext(execCtx, "python3", "/opt/data/home/agy-profiles/orchestrator.py", "workers")
+	if outWork, err := cmdWork.CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(outWork), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.Contains(trimmed, "|") {
+				continue
+			}
+			parts := strings.Split(trimmed, "|")
+			if len(parts) != 5 {
+				continue
+			}
+			accName := normalizeAccount(parts[0])
+			u, exists := usageMap[accName]
+			if !exists {
+				continue
+			}
+			daemonStr := strings.TrimSpace(parts[3])
+			if strings.Contains(daemonStr, "PID") {
+				u.ActiveSession = "🟢 Aktif"
+			} else {
+				u.ActiveSession = "⚪ Mati"
+			}
+		}
+	}
+
+	totalTasks := 0
+	activeTokens := 0
+	activeDaemons := 0
+
+	var b strings.Builder
+	b.WriteString("<b>📊 AGY CLUSTER USAGE MONITOR</b>\n\n")
+	b.WriteString("<pre>")
+	b.WriteString("AKUN   | TOKEN SISA   | SESI AKTIF | SELESAI\n")
+	b.WriteString("-------+--------------+------------+--------\n")
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("agy%02d", i)
+		u := usageMap[name]
+		totalTasks += u.FinishedTasks
+		if strings.Contains(u.TokenRemaining, "m") {
+			activeTokens++
+		}
+		if strings.Contains(u.ActiveSession, "🟢") {
+			activeDaemons++
+		}
+		rem := u.TokenRemaining
+		if len(rem) > 12 {
+			rem = rem[:12]
+		}
+		b.WriteString(fmt.Sprintf("%-6s | %-12s | %-10s | %6d\n", u.Account, rem, u.ActiveSession, u.FinishedTasks))
+	}
+	b.WriteString("-------+--------------+------------+--------\n")
+	b.WriteString(fmt.Sprintf("%-6s | %-12s | %-10s | %6d\n", "TOTAL", fmt.Sprintf("%d/10 Aktif", activeTokens), fmt.Sprintf("%d Daemon", activeDaemons), totalTasks))
+	b.WriteString("</pre>\n\n")
+
+	b.WriteString(fmt.Sprintf("• <b>Total Task Selesai:</b> <code>%d</code>\n", totalTasks))
+	b.WriteString(fmt.Sprintf("• <b>Worker Token Aktif:</b> <code>%d/10</code>\n", activeTokens))
+	b.WriteString(fmt.Sprintf("• <b>Daemon Aktif:</b> <code>%d/10</code>", activeDaemons))
+
+	r.replyHTMLWithBack(chatID, b.String())
 }

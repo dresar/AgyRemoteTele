@@ -94,10 +94,15 @@ func (r *Renderer) RenderWelcome(username string, defaultProfile string, sess *s
 	b.WriteString(fmt.Sprintf("<b>Working Directory:</b> <code>%s</code>\n\n", html.EscapeString(workDir)))
 
 	b.WriteString("<blockquote><b>Quick Access:</b>\n")
+	b.WriteString("• <code>/send &lt;acc&gt; &lt;prompt&gt;</code> - Dispatch task to worker\n")
+	b.WriteString("• <code>/tasks</code> - List active & recent tasks\n")
+	b.WriteString("• <code>/workers</code> - Inspect worker daemons\n")
+	b.WriteString("• <code>/usage</code> - Cluster usage monitor\n")
+	b.WriteString("• <code>/switch &lt;acc&gt;</code> - Switch active worker\n")
+	b.WriteString("• <code>/accounts</code> - View 10 worker account statuses\n")
+	b.WriteString("• <code>/refresh</code> - Refresh active worker tokens\n")
 	b.WriteString("• <code>/ask &lt;prompt&gt;</code> - Dispatch agent task\n")
 	b.WriteString("• <code>/profile [id]</code> - Switch worker profile (agy01-agy15)\n")
-	b.WriteString("• <code>/accounts</code> - View 10 worker account statuses\n")
-	b.WriteString("• <code>/refresh</code> - Refresh all active worker tokens\n")
 	b.WriteString("• <code>/status</code> - Real-time VPS telemetry\n")
 	b.WriteString("• <code>/history</code> - Inspect & resume sessions\n")
 	b.WriteString("• <code>/ls</code> & <code>/cat</code> - Workspace explorer\n")
@@ -111,11 +116,22 @@ func (r *Renderer) RenderHelp() string {
 	var b strings.Builder
 	b.WriteString("<b>🛠 AGY REMOTE TELE — COMMAND REFERENCE</b>\n\n")
 
-	b.WriteString("<b>⚡ Agent Operations:</b>\n")
+	b.WriteString("<b>⚡ Worker Orchestration & Tasks:</b>\n")
+	b.WriteString("• <code>/send &lt;account&gt; &lt;prompt&gt;</code> — Dispatch prompt to worker async (30m timeout)\n")
+	b.WriteString("• <code>/tasks</code> — View active & recent worker tasks\n")
+	b.WriteString("• <code>/workers</code> — View daemon status of workers agy01-agy10\n")
+	b.WriteString("• <code>/usage</code> — Cluster usage monitor (tokens, sessions, completed tasks)\n")
+	b.WriteString("• <code>/switch &lt;account&gt;</code> — Switch active worker profile\n\n")
+
+	b.WriteString("<b>👥 Account & Auth Management:</b>\n")
+	b.WriteString("• <code>/accounts</code> — Check status of worker accounts (with per-account refresh)\n")
+	b.WriteString("• <code>/refresh [account]</code> — Refresh token for all or specific worker\n")
+	b.WriteString("• <code>/login &lt;account&gt;</code> — Generate Google OAuth link for account\n")
+	b.WriteString("• <code>/logout &lt;account&gt;</code> — Revoke token and logout worker account\n\n")
+
+	b.WriteString("<b>🤖 Local Agent Operations:</b>\n")
 	b.WriteString("• <code>/ask &lt;prompt&gt;</code> — Send prompt to Antigravity CLI\n")
 	b.WriteString("• <code>/profile [id]</code> — View or switch active profile\n")
-	b.WriteString("• <code>/accounts</code> — Check 10 worker accounts status\n")
-	b.WriteString("• <code>/refresh</code> — Refresh all active worker tokens\n")
 	b.WriteString("• <code>/history</code> — Browse past session transcripts\n")
 	b.WriteString("• <code>/resume &lt;id&gt;</code> — Resume previous conversation\n")
 	b.WriteString("• <code>/new</code> — Clear session context and start fresh\n\n")
@@ -133,7 +149,7 @@ func (r *Renderer) RenderHelp() string {
 
 	b.WriteString("<b>🔐 Authentication:</b>\n")
 	b.WriteString("• <code>/login &lt;key&gt;</code> — Pair device with admin secret\n")
-	b.WriteString("• <code>/logout</code> — Terminate current authorized session\n")
+	b.WriteString("• <code>/logout</code> — Terminate current Telegram session\n")
 
 	return b.String()
 }
