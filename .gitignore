@@ -1,0 +1,9 @@
+node_modules
+*.tar.gz
+*.log
+*.pid
+.env
+android/.gradle
+android/app/build
+android/local.properties
+.DS_Store

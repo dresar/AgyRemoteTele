@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --card-bg: #ffffff;
+  --card-text: #172033;
+  --card-muted: #667085;
+  --card-border: #e4e7ec;
+  --card-accent: #4f46e5;
+  --card-radius: 4px;
+  --card-shadow:
+    0 2px 8px rgb(16 24 40 / 8%),
+    inset 0 1px 2px rgb(255 255 255 / 85%),
+    inset 0 -1px 2px rgb(16 24 40 / 4%);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background-color: #f8fafc;
+  color: #172033;
+  overflow-x: hidden;
+}
+
+.card {
+  box-sizing: border-box;
+  border: 1px solid var(--card-border);
+  border-radius: 4px;
+  background: var(--card-bg);
+  color: var(--card-text);
+  box-shadow: var(--card-shadow);
+  overflow: hidden;
+}
+
+.card--accent {
+  border-inline-start: 3px solid var(--card-accent);
+}
+
+.card:hover {
+  box-shadow:
+    0 4px 12px rgb(16 24 40 / 11%),
+    inset 0 1px 2px rgb(255 255 255 / 85%),
+    inset 0 -1px 2px rgb(16 24 40 / 4%);
+}
+
+.safe-bottom {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 16px));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .motion-reduced-fade {
+    transition-property: opacity !important;
+    transition-duration: 150ms !important;
+    transform: none !important;
+  }
+}
